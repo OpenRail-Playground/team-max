@@ -35,6 +35,16 @@ Timeline-based bottleneck identification:
 - Locomotive usage
 - Interactive timeline visualization
 
+### 4. Animation Tab 🎬
+
+Animated playback of a simulation run on a schematic yard:
+
+- Wagons and locomotives move along their recorded routes over time
+- Wagons are red until retrofitted, then turn green; locomotives are distinct dark squares
+- Workshops drawn as labeled buildings showing their bay count
+- Native Plotly play/pause + time slider (client-side, smooth scrubbing)
+- User-selectable resolution (frame count), animation length, and playback speed
+
 ## Running the Dashboard
 
 ### Option 1: Batch File (Windows)
