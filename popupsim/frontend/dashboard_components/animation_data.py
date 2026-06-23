@@ -17,6 +17,7 @@ adjacent wagons are told apart by alternating fill shade plus a border.
 
 from __future__ import annotations
 
+import bisect
 from collections import defaultdict
 from dataclasses import dataclass
 from dataclasses import field
@@ -49,6 +50,7 @@ __all__ = [
     'build_frames',
     'build_layout',
     'extract_timelines',
+    'parse_capacity_timeline',
     'rejected_times',
     'wagon_lengths',
 ]
@@ -252,6 +254,47 @@ def rejected_times(rejected_wagons: pd.DataFrame | None) -> list[float]:
         except (ValueError, TypeError):
             continue
     return sorted(times)
+
+
+# --- Capacity timeline (backend reservation events) -------------------------
+
+# Per-track: sorted list of (timestamp, utilization_fraction) pairs.
+CapacityTimeline = dict[str, list[tuple[float, float]]]
+
+
+def parse_capacity_timeline(track_capacity: pd.DataFrame | None) -> CapacityTimeline:
+    """Parse ``track_capacity.csv`` into a per-track step-function of utilization.
+
+    Each track gets a sorted list of ``(timestamp, used_after / capacity)``
+    entries.  Lookup at a given time uses binary search for the last event ≤ t.
+    """
+    if track_capacity is None or track_capacity.empty:
+        return {}
+    required = {'timestamp', 'track_id', 'used_after', 'capacity'}
+    if not required.issubset(track_capacity.columns):
+        return {}
+    timeline: CapacityTimeline = {}
+    for track_id, grp in track_capacity.groupby('track_id', sort=False):
+        entries: list[tuple[float, float]] = []
+        for _, row in grp.sort_values('timestamp').iterrows():
+            cap = float(row['capacity'])
+            if cap <= 0:
+                continue
+            entries.append((float(row['timestamp']), float(row['used_after']) / cap))
+        if entries:
+            timeline[str(track_id)] = entries
+    return timeline
+
+
+def _capacity_util_at(timeline: CapacityTimeline, track_id: str, t: float) -> float | None:
+    """Look up the backend utilization for *track_id* at time *t* (or None if unknown)."""
+    entries = timeline.get(track_id)
+    if not entries:
+        return None
+    idx = bisect.bisect_right(entries, (t, math.inf)) - 1
+    if idx < 0:
+        return 0.0
+    return entries[idx][1]
 
 
 def _build_timeline(resource_id: str, resource_type: str, rows: pd.DataFrame) -> ResourceTrack | None:
@@ -735,7 +778,11 @@ def _dwell_track_at(rt: ResourceTrack, t: float) -> str | None:
 
 
 def _frame_stats(  # pylint: disable=too-many-locals
-    layout: YardLayout, timelines: dict[str, ResourceTrack], t: float, rejected_at: list[float]
+    layout: YardLayout,
+    timelines: dict[str, ResourceTrack],
+    t: float,
+    rejected_at: list[float],
+    capacity_timeline: CapacityTimeline | None = None,
 ) -> FrameStats:
     """Compute the aggregate live statistics for simulation time ``t``."""
     to_retrofit = present_done = cumulative_done = 0
@@ -757,6 +804,11 @@ def _frame_stats(  # pylint: disable=too-many-locals
     for track_id, tl in layout.tracks.items():
         if tl.track_type == 'mainline' or tl.length_m <= 0:
             continue
+        if capacity_timeline:
+            cap_val = _capacity_util_at(capacity_timeline, track_id, t)
+            if cap_val is not None:
+                utilization[track_id] = cap_val
+                continue
         utilization[track_id] = occupied.get(track_id, 0.0) / tl.length_m
 
     cumulative_rejected = sum(1 for rt_t in rejected_at if rt_t <= t)
@@ -802,6 +854,7 @@ class _FrameInputs:
     legs: dict[str, list[ConsistLeg]]
     rejected_at: list[float]
     t_start: float
+    capacity_timeline: CapacityTimeline
 
 
 def _build_one_frame(inputs: _FrameInputs, t: float) -> FrameData:
@@ -820,16 +873,17 @@ def _build_one_frame(inputs: _FrameInputs, t: float) -> FrameData:
         loco_y=acc['loco_y'],
         loco_len=acc['loco_len'],
         loco_ids=acc['loco_ids'],
-        stats=_frame_stats(inputs.layout, inputs.timelines, t, inputs.rejected_at),
+        stats=_frame_stats(inputs.layout, inputs.timelines, t, inputs.rejected_at, inputs.capacity_timeline),
     )
 
 
-def build_frames(
+def build_frames(  # noqa: PLR0913  # pylint: disable=too-many-arguments,too-many-positional-arguments
     layout: YardLayout,
     timelines: dict[str, ResourceTrack],
     num_frames: int,
     bounds: tuple[float, float] | None = None,
     rejected_at: list[float] | None = None,
+    capacity_timeline: CapacityTimeline | None = None,
 ) -> list[FrameData]:
     """Build the per-frame rectangle arrays over a uniform simulation-time grid.
 
@@ -844,7 +898,7 @@ def build_frames(
     legs = assign_positions(layout, timelines)
     t_start, t_end = bounds if bounds is not None else sim_time_bounds(timelines)
     span = t_end - t_start
-    inputs = _FrameInputs(layout, timelines, legs, rejected_at or [], t_start)
+    inputs = _FrameInputs(layout, timelines, legs, rejected_at or [], t_start, capacity_timeline or {})
 
     frames: list[FrameData] = []
     for index in range(num_frames):

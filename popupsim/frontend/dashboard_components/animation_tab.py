@@ -101,12 +101,13 @@ _CONTROLS_TEMPLATE = Template(
 
 
 @st.cache_data(show_spinner=False)
-def _compute_animation(
+def _compute_animation(  # noqa: PLR0913  # pylint: disable=too-many-arguments,too-many-positional-arguments
     resource_locations: pd.DataFrame | None,
     resource_states: pd.DataFrame | None,
     layout_config: dict[str, Any],
     num_frames: int,
     rejected_wagons: pd.DataFrame | None = None,
+    track_capacity: pd.DataFrame | None = None,
 ) -> tuple[ad.YardLayout, list[ad.FrameData]]:
     """Build (and cache) the yard layout and per-frame rectangle arrays.
 
@@ -125,7 +126,10 @@ def _compute_animation(
         active,
     )
     timelines = ad.extract_timelines(resource_locations, resource_states, layout_config.get('wagon_lengths', {}))
-    frames = ad.build_frames(layout, timelines, num_frames, rejected_at=ad.rejected_times(rejected_wagons))
+    cap_tl = ad.parse_capacity_timeline(track_capacity)
+    frames = ad.build_frames(
+        layout, timelines, num_frames, rejected_at=ad.rejected_times(rejected_wagons), capacity_timeline=cap_tl
+    )
     return layout, frames
 
 
@@ -637,6 +641,7 @@ def render_animation_tab(data: dict[str, Any]) -> None:  # pylint: disable=too-m
             },
             num_frames,
             data.get('rejected_wagons'),
+            data.get('track_capacity'),
         )
 
     if not frames:
