@@ -1,0 +1,62 @@
+{
+  "total_events": 5140,
+  "event_counts": {
+    "WagonJourneyEvent": 3243,
+    "LocomotiveMovementEvent": 1402,
+    "BatchFormed": 166,
+    "BatchTransportStarted": 165,
+    "BatchArrivedAtDestination": 164
+  },
+  "trains_arrived": 108,
+  "total_wagons": 611,
+  "wagons_eligible": 538,
+  "wagons_processable": 538,
+  "wagons_arrived": 264,
+  "wagons_parked": 198,
+  "retrofits_completed": 208,
+  "wagons_rejected": 508,
+  "rejected_no_retrofit": 163,
+  "rejected_loaded": 0,
+  "rejected_track_full": 345,
+  "rejected_other": 0,
+  "wagons_distributed": 0,
+  "wagons_in_process": 66,
+  "completion_rate": 0.38661710037174724,
+  "throughput_rate_per_hour": 0.8254012367122907,
+  "workshop_statistics": {
+    "total_workshops": 2,
+    "workshops": {
+      "WS_01": {
+        "wagons_processed": 106,
+        "retrofits_started": 106
+      },
+      "WS_02": {
+        "wagons_processed": 102,
+        "retrofits_started": 102
+      }
+    },
+    "total_wagons_processed": 208
+  },
+  "workshop_utilization": 22.73857064231657,
+  "locomotive_statistics": {
+    "allocations": 165,
+    "releases": 372,
+    "movements": 1118,
+    "total_operations": 1655
+  },
+  "locomotive_time_breakdown": {
+    "LOCO_02": {
+      "moving_time": 13565.0,
+      "idle_time": 0,
+      "coupling_time": 874.0,
+      "decoupling_time": 1112.0
+    },
+    "LOCO_01": {
+      "moving_time": 13697.5,
+      "idle_time": 0,
+      "coupling_time": 848.0,
+      "decoupling_time": 1054.0
+    }
+  },
+  "simulation_duration_minutes": 14400.0
+}

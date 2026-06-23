@@ -1,0 +1,3 @@
+locomotive_id,moving_time_min,coupling_time_screw_min,coupling_time_automatic_min,decoupling_time_screw_min,decoupling_time_automatic_min,total_coupling_time_min,total_decoupling_time_min
+LOCO_01,13663.0,876.0,264.0,1308.0,132.0,1140.0,1440.0
+LOCO_02,13563.0,808.0,274.0,1212.0,134.0,1082.0,1346.0
