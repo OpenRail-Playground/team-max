@@ -51,8 +51,12 @@ Animated playback of a simulation run on a schematic yard:
   - wagons retrofitted currently in the system, and the cumulative retrofitted total
   - cumulative rejected wagons
   - per-track capacity usage (Σ real wagon lengths ÷ real track length, Mainline excluded)
-- Native Plotly play/pause + time slider (client-side, smooth scrubbing)
-- User-selectable resolution (frame count), animation length, and playback speed
+- Native Plotly play/pause + time slider (client-side, smooth scrubbing), with **⏮ / ⏭ buttons**
+  underneath that step a single frame at a time — fully in-browser, staying in sync with play and
+  the slider (the figure is embedded as HTML and loads Plotly from a CDN, so first paint needs
+  internet)
+- User-selectable resolution on a quadratic scale (**200 up to 10,000 frames**), animation length,
+  and playback speed
 
 ## Running the Dashboard
 

@@ -10,11 +10,14 @@ All heavy data preparation lives in
 only handles Streamlit controls and Plotly figure assembly.
 """
 
+from string import Template
 from typing import Any
 
 import pandas as pd
 import plotly.graph_objects as go
+import plotly.io as pio
 import streamlit as st
+import streamlit.components.v1 as components
 
 from dashboard_components import animation_data as ad
 from dashboard_components import routes_graph as rg
@@ -27,6 +30,74 @@ _LANE_HALF_HEIGHT = 0.36
 _TRACK_LINE_WIDTH = 5
 _LABEL_OFFSET_M = 14.0
 _MIN_FRAME_MS = 20
+
+# Selectable animation resolutions on a roughly quadratic scale: fine steps at
+# the low end, coarse jumps toward the (very large) high end.
+_RESOLUTION_OPTIONS = [200, 300, 500, 900, 1500, 2200, 3100, 4200, 5400, 6800, 8300, 10000]
+# Above this many frames the embedded figure JSON gets large and the browser
+# may become sluggish, so we surface a heads-up.
+_HEAVY_FRAME_COUNT = 2000
+
+# The animated figure is embedded as raw HTML (not via ``st.plotly_chart``) so
+# that custom previous/next buttons can drive ``Plotly.animate`` entirely in the
+# browser, staying in sync with the native play/pause and slider.
+_PLOT_DIV_ID = 'yard-animation'
+# ``string.Template`` ($-substitution) avoids escaping every brace in the JS.
+_CONTROLS_TEMPLATE = Template(
+    """
+<div class="yard-controls">
+  <button type="button" id="${div}-prev" class="yard-btn">⏮ Previous frame</button>
+  <button type="button" id="${div}-next" class="yard-btn">⏭ Next frame</button>
+  <span class="yard-frame" id="${div}-label"></span>
+</div>
+<style>
+  .yard-controls { display:flex; align-items:center; gap:8px; margin:2px 0 0 6px;
+                   font-family:"Source Sans Pro",sans-serif; }
+  .yard-btn { padding:4px 12px; border:1px solid #ccc; border-radius:6px;
+              background:#f6f6f6; cursor:pointer; font-size:14px; }
+  .yard-btn:hover { background:#e9e9e9; }
+  .yard-frame { color:#555; font-size:13px; }
+</style>
+<script>
+(function() {
+  var divId = "$div";
+  var N = $n;
+  var cur = 0;
+  function gd() { return document.getElementById(divId); }
+  function clamp(i) { return Math.max(0, Math.min(N - 1, i)); }
+  function refresh() {
+    var label = document.getElementById(divId + "-label");
+    if (label) { label.textContent = "Frame " + (cur + 1) + " / " + N; }
+  }
+  function go(i) {
+    cur = clamp(i);
+    Plotly.animate(gd(), [String(cur)],
+      {mode: "immediate", frame: {duration: 0, redraw: true}, transition: {duration: 0}});
+    refresh();
+  }
+  function wire() {
+    document.getElementById(divId + "-prev").addEventListener("click", function() { go(cur - 1); });
+    document.getElementById(divId + "-next").addEventListener("click", function() { go(cur + 1); });
+    // The native play button and slider both animate by frame name, so this one
+    // handler keeps "cur" in sync with every kind of navigation.
+    gd().on("plotly_animatingframe", function(e) {
+      if (e && e.name !== undefined && e.name !== null) {
+        var idx = parseInt(e.name, 10);
+        if (!isNaN(idx)) { cur = idx; refresh(); }
+      }
+    });
+    refresh();
+  }
+  function ready() {
+    var g = gd();
+    if (window.Plotly && g && g._fullLayout) { wire(); }
+    else { setTimeout(ready, 60); }
+  }
+  ready();
+})();
+</script>
+"""
+)
 
 
 @st.cache_data(show_spinner=False)
@@ -91,7 +162,8 @@ _WAGON_BORDER_PENDING = '#013a63'
 _WAGON_BORDER_DONE = '#04503a'
 _LOCO_BORDER = '#f1c40f'
 _STATS_FONT = {'size': 12, 'color': '#2c3e50'}
-_UTIL_FONT_SIZE = 8
+_UTIL_FONT_SIZE = 16
+_UTIL_THROAT_OFFSET_M = 14.0
 
 
 def _wagon_groups(frame: ad.FrameData) -> dict[tuple[str, int], dict[str, list[float]]]:
@@ -161,9 +233,12 @@ def _utilization_trace(frame: ad.FrameData, layout: ad.YardLayout) -> go.Scatter
         tl = layout.tracks.get(track_id)
         if tl is None:
             continue
-        inward = 1.0 if (tl.x_start + tl.x_end) / 2.0 >= tl.throat_x else -1.0
-        xs.append(tl.throat_x + inward * 6.0)
-        ys.append(tl.lane_y + 0.3)
+        # Place the label on the throat side: in zone mode that is the inner
+        # (corridor) side — right of the left throat, left of the right throat.
+        toward_throat = 1.0 if tl.throat_x >= (tl.x_start + tl.x_end) / 2.0 else -1.0
+        to_corridor = 1.0 if layout.mode == 'zones' else -1.0
+        xs.append(tl.throat_x + toward_throat * to_corridor * _UTIL_THROAT_OFFSET_M)
+        ys.append(tl.lane_y)
         texts.append(f'{usage * 100:.0f}%')
         colors.append('#c0392b' if usage > 1.0 else '#34495e')
     return go.Scatter(
@@ -427,7 +502,9 @@ def _draw_workshop(fig: go.Figure, tl: ad.TrackLayout) -> None:
     )
 
 
-def _animation_controls(frames: list[ad.FrameData], frame_ms: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _animation_controls(
+    frames: list[ad.FrameData], frame_ms: int, active: int
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Build the play/pause buttons (updatemenus) and the time slider."""
     play_args = {'frame': {'duration': frame_ms, 'redraw': True}, 'fromcurrent': True, 'transition': {'duration': 0}}
     pause_args = {'frame': {'duration': 0, 'redraw': False}, 'mode': 'immediate', 'transition': {'duration': 0}}
@@ -459,7 +536,7 @@ def _animation_controls(frames: list[ad.FrameData], frame_ms: int) -> tuple[list
     ]
     sliders = [
         {
-            'active': 0,
+            'active': active,
             'x': 0.12,
             'len': 0.88,
             'xanchor': 'left',
@@ -473,9 +550,12 @@ def _animation_controls(frames: list[ad.FrameData], frame_ms: int) -> tuple[list
     return updatemenus, sliders
 
 
-def _build_figure(layout: ad.YardLayout, frames: list[ad.FrameData], frame_ms: int, show_labels: bool) -> go.Figure:
-    """Assemble the full animated Plotly figure."""
-    first = frames[0]
+def _build_figure(
+    layout: ad.YardLayout, frames: list[ad.FrameData], frame_ms: int, show_labels: bool, active_frame: int = 0
+) -> go.Figure:
+    """Assemble the full animated Plotly figure, opened at ``active_frame``."""
+    active = max(0, min(active_frame, len(frames) - 1))
+    first = frames[active]
     fig = go.Figure(data=[*_dynamic_traces(first, layout, show_labels), *_legend_traces()])
     _add_static_geometry(fig, layout)
 
@@ -484,7 +564,7 @@ def _build_figure(layout: ad.YardLayout, frames: list[ad.FrameData], frame_ms: i
         for i, f in enumerate(frames)
     ]
 
-    updatemenus, sliders = _animation_controls(frames, frame_ms)
+    updatemenus, sliders = _animation_controls(frames, frame_ms, active)
     fig.update_layout(
         height=max(520, len(layout.tracks) * 28),
         margin={'l': 10, 'r': 40, 't': 30, 'b': 10},
@@ -505,13 +585,12 @@ def _render_controls() -> tuple[int, int, float, bool]:
     """
     col1, col2, col3 = st.columns(3)
     with col1:
-        num_frames = st.slider(
+        num_frames = st.selectbox(
             'Resolution (frames)',
-            min_value=50,
-            max_value=600,
-            value=200,
-            step=50,
-            help='More frames = smoother motion but a larger figure.',
+            options=_RESOLUTION_OPTIONS,
+            index=0,
+            help='More frames = smoother motion and finer stepping, but a larger figure. '
+            'The scale is quadratic, from 200 up to 10,000 frames.',
         )
     with col2:
         anim_length_s = st.slider(
@@ -524,8 +603,33 @@ def _render_controls() -> tuple[int, int, float, bool]:
         )
     with col3:
         speed = st.select_slider('Playback speed', options=[0.25, 0.5, 1.0, 2.0, 4.0], value=1.0)
-    show_labels = st.checkbox('Show wagon / locomotive ids on rectangles', value=True)
+    show_labels = st.checkbox('Show wagon / locomotive ids on rectangles', value=False)
     return num_frames, anim_length_s, speed, show_labels
+
+
+def _render_player(fig: go.Figure, num_frames: int) -> None:
+    """Embed the animated figure as HTML with client-side previous/next buttons.
+
+    Rendering through :func:`streamlit.components.v1.html` (instead of
+    ``st.plotly_chart``) lets the prev/next buttons call ``Plotly.animate`` in
+    the browser, so stepping never triggers a Streamlit rerun and stays in sync
+    with the native play/pause and slider.
+    """
+    plot_html = pio.to_html(
+        fig,
+        include_plotlyjs='cdn',
+        full_html=False,
+        auto_play=False,
+        div_id=_PLOT_DIV_ID,
+        config={
+            'responsive': True,
+            'displayModeBar': True,
+            'toImageButtonOptions': {'format': 'png', 'filename': 'yard_animation'},
+        },
+    )
+    controls = _CONTROLS_TEMPLATE.safe_substitute(div=_PLOT_DIV_ID, n=num_frames)
+    height = int(fig.layout.height or 520) + 70
+    components.html(f'<div class="yard-player">{plot_html}{controls}</div>', height=height, scrolling=False)
 
 
 def render_animation_tab(data: dict[str, Any]) -> None:  # pylint: disable=too-many-locals
@@ -574,15 +678,17 @@ def render_animation_tab(data: dict[str, Any]) -> None:  # pylint: disable=too-m
         st.info('No movement data available to animate for this scenario.')
         return
 
+    if num_frames >= _HEAVY_FRAME_COUNT:
+        st.warning(
+            f'⚠️ {num_frames:,} frames produces a large figure — playback and stepping may be sluggish '
+            'in the browser. Lower the resolution if it feels slow.'
+        )
+
     frame_ms = max(_MIN_FRAME_MS, int(anim_length_s * 1000 / num_frames / speed))
     fig = _build_figure(layout, frames, frame_ms, show_labels)
-
-    st.plotly_chart(
-        fig,
-        use_container_width=True,
-        config={'displayModeBar': True, 'toImageButtonOptions': {'format': 'png', 'filename': 'yard_animation'}},
-    )
+    _render_player(fig, len(frames))
     st.caption(
         f'{len(frames)} frames · {len(layout.tracks)} tracks · x-axis in metres along track · '
-        f'press ▶ Play, drag the slider to scrub, hover a rectangle for its id.'
+        f'press ▶ Play, drag the slider or use ⏮ / ⏭ to step a single frame, hover a rectangle for its id. '
+        f'(Loads Plotly from a CDN — needs internet on first paint.)'
     )
