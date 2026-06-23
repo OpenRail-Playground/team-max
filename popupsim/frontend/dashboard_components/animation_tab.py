@@ -17,6 +17,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from dashboard_components import animation_data as ad
+from dashboard_components import routes_graph as rg
 
 # Rectangle height in lane units (nominal: the y-axis is a lane index, not
 # metric, so true 3 m would render as an invisible hairline against a yard that
@@ -34,20 +35,26 @@ def _compute_animation(
     resource_states: pd.DataFrame | None,
     layout_config: dict[str, Any],
     num_frames: int,
+    rejected_wagons: pd.DataFrame | None = None,
 ) -> tuple[ad.YardLayout, list[ad.FrameData]]:
     """Build (and cache) the yard layout and per-frame rectangle arrays.
 
     Cached on the raw inputs + resolution so scrubbing/replaying is instant.
-    ``layout_config`` bundles the ``tracks`` / ``topology`` / ``workshops``
-    config plus the ``wagon_lengths`` map.
+    ``layout_config`` bundles the ``tracks`` / ``topology`` / ``workshops`` /
+    ``routes`` config plus the ``wagon_lengths`` map. ``rejected_wagons`` feeds
+    the cumulative rejected-wagon counter.
     """
+    route_graph = rg.parse_routes(layout_config.get('routes'))
+    active = ad.active_track_ids(resource_locations, route_graph)
     layout = ad.build_layout(
         layout_config.get('tracks', []),
         layout_config.get('topology', {}),
         layout_config.get('workshops', []),
+        route_graph,
+        active,
     )
     timelines = ad.extract_timelines(resource_locations, resource_states, layout_config.get('wagon_lengths', {}))
-    frames = ad.build_frames(layout, timelines, num_frames)
+    frames = ad.build_frames(layout, timelines, num_frames, rejected_at=ad.rejected_times(rejected_wagons))
     return layout, frames
 
 
@@ -74,44 +81,124 @@ def _rect_trace(xs: list[float], ys: list[float], lengths: list[float], color: s
         mode='lines',
         fill='toself',
         fillcolor=color,
-        line={'color': line_color, 'width': 0.5},
+        line={'color': line_color, 'width': 1.1},
         hoverinfo='skip',
         showlegend=False,
     )
 
 
-def _split_wagons(frame: ad.FrameData) -> tuple[dict[str, list[float]], dict[str, list[float]]]:
-    """Split a frame's wagons into pending (red) and done (green) groups."""
-    pending: dict[str, list[float]] = {'x': [], 'y': [], 'len': []}
-    done: dict[str, list[float]] = {'x': [], 'y': [], 'len': []}
-    for x, y, length, color in zip(frame.wagon_x, frame.wagon_y, frame.wagon_len, frame.wagon_color, strict=False):
-        target = done if color == ad.WAGON_COLOR_DONE else pending
-        target['x'].append(x)
-        target['y'].append(y)
-        target['len'].append(length)
-    return pending, done
+_WAGON_BORDER_PENDING = '#013a63'
+_WAGON_BORDER_DONE = '#04503a'
+_LOCO_BORDER = '#f1c40f'
+_STATS_FONT = {'size': 12, 'color': '#2c3e50'}
+_UTIL_FONT_SIZE = 8
 
 
-def _dynamic_traces(frame: ad.FrameData) -> list[go.Scatter]:
-    """Build the four dynamic traces (red wagons, green wagons, locos, hover)."""
-    pending, done = _split_wagons(frame)
-    hover_x = frame.wagon_x + frame.loco_x
-    hover_y = frame.wagon_y + frame.loco_y
-    hover_ids = frame.wagon_ids + frame.loco_ids
+def _wagon_groups(frame: ad.FrameData) -> dict[tuple[str, int], dict[str, list[float]]]:
+    """Group a frame's wagons by (status, shade) so each renders in its own shade."""
+    groups: dict[tuple[str, int], dict[str, list[float]]] = {
+        (status, shade): {'x': [], 'y': [], 'len': []} for status in ('pending', 'done') for shade in (0, 1)
+    }
+    rows = zip(frame.wagon_x, frame.wagon_y, frame.wagon_len, frame.wagon_color, frame.wagon_shade, strict=False)
+    for x, y, length, color, shade in rows:
+        status = 'done' if color == ad.WAGON_COLOR_DONE else 'pending'
+        group = groups[(status, shade)]
+        group['x'].append(x)
+        group['y'].append(y)
+        group['len'].append(length)
+    return groups
+
+
+def _label_trace(frame: ad.FrameData, show_labels: bool) -> go.Scatter:
+    """Build the hover/label trace carrying every resource id."""
+    return go.Scatter(
+        x=frame.wagon_x + frame.loco_x,
+        y=frame.wagon_y + frame.loco_y,
+        mode='markers+text' if show_labels else 'markers',
+        marker={'size': 12, 'color': 'rgba(0,0,0,0)'},
+        text=frame.wagon_ids + frame.loco_ids,
+        textposition='middle center',
+        textfont={'size': 6, 'color': '#ffffff'},
+        hovertemplate='%{text}<extra></extra>',
+        showlegend=False,
+    )
+
+
+def _counters_trace(frame: ad.FrameData, layout: ad.YardLayout) -> go.Scatter:
+    """Build the live counters text block, placed in the middle (empty) section."""
+    s = frame.stats
+    text = (
+        f'<b>To retrofit (in system): {s.to_retrofit}</b><br>'
+        f'Retrofitted (in system): {s.present_retrofitted}<br>'
+        f'Retrofitted (cumulative): {s.cumulative_retrofitted}<br>'
+        f'Rejected (cumulative): {s.cumulative_rejected}'
+    )
+    if layout.mode == 'zones':
+        x = (layout.left_throat_x + layout.right_throat_x) / 2.0
+        y = layout.corridor_y + 1.0
+    else:
+        x = layout.x_max * 0.5
+        y = layout.y_max + 0.7
+    return go.Scatter(
+        x=[x],
+        y=[y],
+        mode='text',
+        text=[text],
+        textposition='middle center',
+        textfont=_STATS_FONT,
+        hoverinfo='skip',
+        showlegend=False,
+    )
+
+
+def _utilization_trace(frame: ad.FrameData, layout: ad.YardLayout) -> go.Scatter:
+    """Build the per-track capacity-usage labels (one '%' per non-mainline lane)."""
+    xs: list[float] = []
+    ys: list[float] = []
+    texts: list[str] = []
+    colors: list[str] = []
+    for track_id, usage in frame.stats.utilization.items():
+        tl = layout.tracks.get(track_id)
+        if tl is None:
+            continue
+        inward = 1.0 if (tl.x_start + tl.x_end) / 2.0 >= tl.throat_x else -1.0
+        xs.append(tl.throat_x + inward * 6.0)
+        ys.append(tl.lane_y + 0.3)
+        texts.append(f'{usage * 100:.0f}%')
+        colors.append('#c0392b' if usage > 1.0 else '#34495e')
+    return go.Scatter(
+        x=xs,
+        y=ys,
+        mode='text',
+        text=texts,
+        textposition='middle center',
+        textfont={'size': _UTIL_FONT_SIZE, 'color': colors or '#34495e'},
+        hoverinfo='skip',
+        showlegend=False,
+    )
+
+
+def _dynamic_traces(frame: ad.FrameData, layout: ad.YardLayout, show_labels: bool) -> list[go.Scatter]:
+    """Build the per-frame traces (4 wagon shade groups, locos, labels, stats)."""
+    groups = _wagon_groups(frame)
     return [
-        _rect_trace(pending['x'], pending['y'], pending['len'], ad.WAGON_COLOR_PENDING, '#7b241c'),
-        _rect_trace(done['x'], done['y'], done['len'], ad.WAGON_COLOR_DONE, '#1e8449'),
-        _rect_trace(frame.loco_x, frame.loco_y, frame.loco_len, ad.LOCO_COLOR, '#f1c40f'),
-        go.Scatter(
-            x=hover_x,
-            y=hover_y,
-            mode='markers',
-            marker={'size': 12, 'color': 'rgba(0,0,0,0)'},
-            text=hover_ids,
-            hovertemplate='%{text}<extra></extra>',
-            showlegend=False,
-        ),
+        _rect_trace(*_unpack(groups[('pending', 0)]), ad.WAGON_SHADES_PENDING[0], _WAGON_BORDER_PENDING),
+        _rect_trace(*_unpack(groups[('pending', 1)]), ad.WAGON_SHADES_PENDING[1], _WAGON_BORDER_PENDING),
+        _rect_trace(*_unpack(groups[('done', 0)]), ad.WAGON_SHADES_DONE[0], _WAGON_BORDER_DONE),
+        _rect_trace(*_unpack(groups[('done', 1)]), ad.WAGON_SHADES_DONE[1], _WAGON_BORDER_DONE),
+        _rect_trace(frame.loco_x, frame.loco_y, frame.loco_len, ad.LOCO_COLOR, _LOCO_BORDER),
+        _label_trace(frame, show_labels),
+        _counters_trace(frame, layout),
+        _utilization_trace(frame, layout),
     ]
+
+
+_DYNAMIC_TRACE_COUNT = 8
+
+
+def _unpack(group: dict[str, list[float]]) -> tuple[list[float], list[float], list[float]]:
+    """Return the (x, y, len) arrays of a wagon group."""
+    return group['x'], group['y'], group['len']
 
 
 def _legend_traces() -> list[go.Scatter]:
@@ -137,7 +224,32 @@ def _legend_traces() -> list[go.Scatter]:
 
 
 def _add_static_geometry(fig: go.Figure, layout: ad.YardLayout) -> None:
-    """Draw track lines, workshop boxes with bay dividers, throat and labels."""
+    """Draw the static yard skeleton, dispatching on the layout mode."""
+    if layout.mode == 'zones':
+        _add_zone_geometry(fig, layout)
+    else:
+        _add_single_geometry(fig, layout)
+
+
+def _track_line(fig: go.Figure, tl: ad.TrackLayout) -> None:
+    """Draw a single track as a workshop box or a plain horizontal line."""
+    if tl.is_workshop:
+        _draw_workshop(fig, tl)
+    else:
+        fig.add_shape(
+            type='line',
+            x0=tl.x_start,
+            y0=tl.lane_y,
+            x1=tl.x_end,
+            y1=tl.lane_y,
+            line={'color': tl.color, 'width': _TRACK_LINE_WIDTH},
+            opacity=0.5,
+            layer='below',
+        )
+
+
+def _add_single_geometry(fig: go.Figure, layout: ad.YardLayout) -> None:
+    """Single-column layout: one vertical throat with stacked lanes."""
     y_lo, y_hi = layout.y_min - 0.6, layout.y_max + 0.6
     fig.add_shape(
         type='line',
@@ -148,21 +260,20 @@ def _add_static_geometry(fig: go.Figure, layout: ad.YardLayout) -> None:
         line={'color': '#bdc3c7', 'width': 3, 'dash': 'dot'},
         layer='below',
     )
-
     for tl in layout.tracks.values():
-        if tl.is_workshop:
-            _draw_workshop(fig, tl)
-        else:
+        if tl.track_type == 'mainline':
             fig.add_shape(
                 type='line',
-                x0=tl.x_start,
+                x0=layout.throat_x,
                 y0=tl.lane_y,
-                x1=tl.x_end,
+                x1=layout.x_max,
                 y1=tl.lane_y,
-                line={'color': tl.color, 'width': _TRACK_LINE_WIDTH},
-                opacity=0.5,
+                line={'color': tl.color, 'width': 9},
+                opacity=0.85,
                 layer='below',
             )
+        else:
+            _track_line(fig, tl)
         fig.add_annotation(
             x=layout.throat_x - _LABEL_OFFSET_M,
             y=tl.lane_y,
@@ -170,6 +281,113 @@ def _add_static_geometry(fig: go.Figure, layout: ad.YardLayout) -> None:
             showarrow=False,
             xanchor='right',
             font={'size': 9, 'color': '#555'},
+        )
+    _add_cluster_labels(fig, layout)
+
+
+def _add_zone_geometry(fig: go.Figure, layout: ad.YardLayout) -> None:
+    """Three-zone layout: local yard | Mainline corridor | remote storage."""
+    y_lo, y_hi = layout.y_min - 0.6, layout.y_max + 0.6
+    # Zone background bands.
+    fig.add_shape(
+        type='rect',
+        x0=0,
+        y0=y_lo,
+        x1=layout.left_throat_x,
+        y1=y_hi,
+        fillcolor='#2980b9',
+        opacity=0.04,
+        line={'width': 0},
+        layer='below',
+    )
+    fig.add_shape(
+        type='rect',
+        x0=layout.right_throat_x,
+        y0=y_lo,
+        x1=layout.x_max,
+        y1=y_hi,
+        fillcolor='#8e44ad',
+        opacity=0.04,
+        line={'width': 0},
+        layer='below',
+    )
+    # Ladders (the connecting throat at each zone's inner edge).
+    for ladder_x in (layout.left_throat_x, layout.right_throat_x):
+        fig.add_shape(
+            type='line',
+            x0=ladder_x,
+            y0=y_lo,
+            x1=ladder_x,
+            y1=y_hi,
+            line={'color': '#bdc3c7', 'width': 3, 'dash': 'dot'},
+            layer='below',
+        )
+    # Mainline corridor spanning the middle.
+    main_color = ad.TRACK_TYPE_COLORS['mainline']
+    fig.add_shape(
+        type='line',
+        x0=layout.left_throat_x,
+        y0=layout.corridor_y,
+        x1=layout.right_throat_x,
+        y1=layout.corridor_y,
+        line={'color': main_color, 'width': 9},
+        opacity=0.85,
+        layer='below',
+    )
+
+    for tl in layout.tracks.values():
+        if tl.track_type == 'mainline':
+            continue
+        _track_line(fig, tl)
+        if tl.zone == 'right':
+            label_x, anchor = tl.x_end + _LABEL_OFFSET_M, 'left'
+        else:
+            label_x, anchor = tl.x_start - _LABEL_OFFSET_M, 'right'
+        fig.add_annotation(
+            x=label_x,
+            y=tl.lane_y,
+            text=tl.track_id,
+            showarrow=False,
+            xanchor=anchor,
+            font={'size': 9, 'color': '#555'},
+        )
+    _add_zone_titles(fig, layout)
+
+
+def _add_zone_titles(fig: go.Figure, layout: ad.YardLayout) -> None:
+    """Add the three zone headings above the layout."""
+    y = layout.y_max + 0.9
+    titles = [
+        (layout.left_throat_x / 2.0, 'Local retrofit yard', '#2471a3'),
+        ((layout.left_throat_x + layout.right_throat_x) / 2.0, '🚆 Main line', '#566573'),
+        ((layout.right_throat_x + layout.x_max) / 2.0, 'Arrival / remote storage', '#6c3483'),
+    ]
+    for x, text, color in titles:
+        fig.add_annotation(x=x, y=y, text=text, showarrow=False, font={'size': 11, 'color': color})
+
+
+def _add_cluster_labels(fig: go.Figure, layout: ad.YardLayout) -> None:
+    """Annotate the connectivity clusters on the right margin (single mode)."""
+    labels = {'remote': 'Arrival / remote storage', 'local': 'Local retrofit yard', 'hub': 'Local retrofit yard'}
+    grouped: dict[str, list[float]] = {}
+    for tl in layout.tracks.values():
+        if tl.track_type == 'mainline':
+            continue
+        grouped.setdefault(tl.cluster, []).append(tl.lane_y)
+    seen: set[str] = set()
+    for cluster, ys in grouped.items():
+        text = labels.get(cluster)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        fig.add_annotation(
+            x=layout.x_max,
+            y=sum(ys) / len(ys),
+            text=text,
+            showarrow=False,
+            xanchor='left',
+            textangle=90,
+            font={'size': 10, 'color': '#888'},
         )
 
 
@@ -255,20 +473,23 @@ def _animation_controls(frames: list[ad.FrameData], frame_ms: int) -> tuple[list
     return updatemenus, sliders
 
 
-def _build_figure(layout: ad.YardLayout, frames: list[ad.FrameData], frame_ms: int) -> go.Figure:
+def _build_figure(layout: ad.YardLayout, frames: list[ad.FrameData], frame_ms: int, show_labels: bool) -> go.Figure:
     """Assemble the full animated Plotly figure."""
     first = frames[0]
-    fig = go.Figure(data=[*_dynamic_traces(first), *_legend_traces()])
+    fig = go.Figure(data=[*_dynamic_traces(first, layout, show_labels), *_legend_traces()])
     _add_static_geometry(fig, layout)
 
-    fig.frames = [go.Frame(name=str(i), data=_dynamic_traces(f), traces=[0, 1, 2, 3]) for i, f in enumerate(frames)]
+    fig.frames = [
+        go.Frame(name=str(i), data=_dynamic_traces(f, layout, show_labels), traces=list(range(_DYNAMIC_TRACE_COUNT)))
+        for i, f in enumerate(frames)
+    ]
 
     updatemenus, sliders = _animation_controls(frames, frame_ms)
     fig.update_layout(
         height=max(520, len(layout.tracks) * 28),
-        margin={'l': 10, 'r': 10, 't': 30, 'b': 10},
+        margin={'l': 10, 'r': 40, 't': 30, 'b': 10},
         plot_bgcolor='white',
-        xaxis={'visible': False, 'range': [-_LABEL_OFFSET_M * 5, layout.x_max + _LABEL_OFFSET_M]},
+        xaxis={'visible': False, 'range': [-_LABEL_OFFSET_M * 5, layout.x_max + _LABEL_OFFSET_M * 4]},
         yaxis={'visible': False, 'range': [layout.y_min - 0.8, layout.y_max + 1.0]},
         legend={'orientation': 'h', 'yanchor': 'bottom', 'y': 1.02, 'xanchor': 'left', 'x': 0},
         updatemenus=updatemenus,
@@ -277,8 +498,11 @@ def _build_figure(layout: ad.YardLayout, frames: list[ad.FrameData], frame_ms: i
     return fig
 
 
-def _render_controls() -> tuple[int, int, float]:
-    """Render the playback control widgets; return (num_frames, length_s, speed)."""
+def _render_controls() -> tuple[int, int, float, bool]:
+    """Render the playback control widgets.
+
+    Returns ``(num_frames, length_s, speed, show_labels)``.
+    """
     col1, col2, col3 = st.columns(3)
     with col1:
         num_frames = st.slider(
@@ -300,16 +524,18 @@ def _render_controls() -> tuple[int, int, float]:
         )
     with col3:
         speed = st.select_slider('Playback speed', options=[0.25, 0.5, 1.0, 2.0, 4.0], value=1.0)
-    return num_frames, anim_length_s, speed
+    show_labels = st.checkbox('Show wagon / locomotive ids on rectangles', value=True)
+    return num_frames, anim_length_s, speed, show_labels
 
 
-def render_animation_tab(data: dict[str, Any]) -> None:
+def render_animation_tab(data: dict[str, Any]) -> None:  # pylint: disable=too-many-locals
     """Render the animated simulation playback tab."""
     st.header('🎬 Simulation Animation')
     st.caption(
         'Playback of wagon and locomotive movements through the yard. Resources are flat, '
-        'length-accurate rectangles: wagons red until retrofitted then green, locomotives dark. '
-        'Parked wagons pack to the far end of storage tracks; workshops show one slot per bay.'
+        'length-accurate rectangles: wagons blue until retrofitted then green, locomotives dark. '
+        'Wagons pack flush (no gap) and alternate shade so they stay countable. Live counters and '
+        'per-track capacity usage update as the clock advances.'
     )
 
     resource_locations = data.get('resource_locations')
@@ -327,7 +553,7 @@ def render_animation_tab(data: dict[str, Any]) -> None:
         st.warning('⚠️ No track configuration found — cannot build the yard layout.')
         return
 
-    num_frames, anim_length_s, speed = _render_controls()
+    num_frames, anim_length_s, speed, show_labels = _render_controls()
 
     with st.spinner('Preparing animation...'):
         layout, frames = _compute_animation(
@@ -337,9 +563,11 @@ def render_animation_tab(data: dict[str, Any]) -> None:
                 'tracks': tracks_config,
                 'topology': topology,
                 'workshops': workshops_config,
+                'routes': scenario_config.get('routes'),
                 'wagon_lengths': lengths,
             },
             num_frames,
+            data.get('rejected_wagons'),
         )
 
     if not frames:
@@ -347,7 +575,7 @@ def render_animation_tab(data: dict[str, Any]) -> None:
         return
 
     frame_ms = max(_MIN_FRAME_MS, int(anim_length_s * 1000 / num_frames / speed))
-    fig = _build_figure(layout, frames, frame_ms)
+    fig = _build_figure(layout, frames, frame_ms, show_labels)
 
     st.plotly_chart(
         fig,

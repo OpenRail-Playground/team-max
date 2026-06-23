@@ -40,8 +40,17 @@ Timeline-based bottleneck identification:
 Animated playback of a simulation run on a schematic yard:
 
 - Wagons and locomotives move along their recorded routes over time
-- Wagons are red until retrofitted, then turn green; locomotives are distinct dark squares
-- Workshops drawn as labeled buildings showing their bay count
+- Wagons are **blue** until retrofitted, then turn **green** (color-blind-safe Okabe-Ito palette);
+  locomotives are distinct dark squares
+- Wagons are drawn flush (no gap, as coupled wagons really are) and alternate fill shade plus a
+  border so individual wagons stay countable
+- Workshops drawn as labeled buildings showing their bay count; wagons always render inside the box
+- Three-zone layout (local yard · Mainline corridor · remote storage) when routes span the Mainline
+- **Live statistics** that update as the clock advances (in the middle Mainline section):
+  - wagons still to retrofit currently in the system
+  - wagons retrofitted currently in the system, and the cumulative retrofitted total
+  - cumulative rejected wagons
+  - per-track capacity usage (Σ real wagon lengths ÷ real track length, Mainline excluded)
 - Native Plotly play/pause + time slider (client-side, smooth scrubbing)
 - User-selectable resolution (frame count), animation length, and playback speed
 
