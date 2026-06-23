@@ -1,0 +1,55 @@
+{
+  "id": "priority_dispatch_scenario",
+  "description": "DAC retrofit simulation with priority-based locomotive dispatch. Same infrastructure as baseline but with fill-level-dependent task prioritization and hold conditions.",
+  "version": "1.0.0",
+  "start_date": "2025-12-01T00:00:00+00:00",
+  "end_date": "2025-12-11T00:00:00+00:00",
+  "workflow_mode": "retrofit_workflow",
+  "collection_track_strategy": "first_available",
+  "retrofit_selection_strategy": "least_occupied",
+  "retrofitted_selection_strategy": "least_occupied",
+  "workshop_selection_strategy": "least_occupied",
+  "parking_selection_strategy": "least_occupied",
+  "task_priorities": {
+    "collection_to_retrofit": {
+      "base_priority": 3,
+      "hold_until": {
+        "condition": "target_fill_below",
+        "threshold": 0.85
+      },
+      "max_hold_time": null,
+      "rules": []
+    },
+    "retrofit_to_workshop": {
+      "base_priority": 2,
+      "rules": []
+    },
+    "workshop_to_retrofitted": {
+      "base_priority": 1
+    },
+    "retrofitted_to_parking": {
+      "base_priority": 3,
+      "hold_until": {
+        "condition": "source_fill_above",
+        "threshold": 0.35
+      },
+      "max_hold_time": 45.0,
+      "rules": [
+        {
+          "condition": "source_fill_above",
+          "threshold": 0.85,
+          "priority": 0
+        }
+      ]
+    }
+  },
+  "references": {
+    "locomotives": "locomotive.json",
+    "process_times": "process_times.json",
+    "routes": "routes.json",
+    "trains": "train_schedule.csv",
+    "topology": "topology.json",
+    "tracks": "tracks.json",
+    "workshops": "workshops.json"
+  }
+}

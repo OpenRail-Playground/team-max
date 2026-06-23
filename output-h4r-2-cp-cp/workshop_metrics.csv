@@ -1,0 +1,3 @@
+workshop_id,completed_retrofits,total_retrofit_time,total_waiting_time,throughput_per_hour,utilization_percent
+WS_01,163,9780.0,18993.0,0.679803982900636,33.9901991450318
+WS_02,160,9600.0,19173.0,0.6672922531539985,33.36461265769993
