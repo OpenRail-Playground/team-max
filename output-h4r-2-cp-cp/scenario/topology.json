@@ -15,7 +15,7 @@
     "parking13": {"nodes": [1, 2], "length": 740.0},
     "parking14": {"nodes": [1, 2], "length": 740.0},
     "parking15": {"nodes": [1, 2], "length": 740.0},
-    "parking16": {"nodes": [1, 2], "length": 2500.0},
+    "parking16": {"nodes": [1, 2], "length": 1250.0},
     "track_19": {"nodes": [1, 2], "length": 169.0},
     "collection1": {"nodes": [1, 2], "length": 500.0},
     "collection2": {"nodes": [1, 2], "length": 500.0},
