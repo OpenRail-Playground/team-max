@@ -1,26 +1,18 @@
 """Pure data transforms for the simulation animation tab.
 
 This module intentionally avoids any Streamlit or Plotly imports so that the
-geometry and timeline logic stays fully unit-testable. It turns the raw
+timeline and motion logic stays fully unit-testable. It turns the raw
 ``resource_locations`` / ``resource_states`` event logs and the scenario
-``tracks`` / ``topology`` / ``workshops`` / ``train_schedule`` configuration
-into:
+configuration into per-resource movement timelines and per-frame rectangle
+arrays. The yard geometry itself lives in
+:mod:`dashboard_components.animation_layout` (re-exported here for convenience).
 
-* a synthetic yard layout with a **metric x-axis** (track length in metres) and
-  a connecting throat at ``x = 0``,
-* per-resource movement timelines (dwell + route-aware transit segments),
-* per-frame rectangle centres + lengths + colours, ready to be drawn as flat,
-  non-overlapping, train-like rectangles by Plotly.
-
-Wagons are sized by their real length (from ``train_schedule.csv``); locomotives
-use a default length. Each parked resource is given a **fixed** position when it
-arrives (it never shifts while stationary): occupants pack flush, end-to-end
-(no gap — coupled wagons have no space between them). Parking/storage tracks
-pack from the far end (furthest from the throat) inward, retrofit tracks pack
-from the throat, and workshops use one slot per retrofit bay. A departing
-resource leaves its slot behind (parked wagons do not slide), and the freed
-space is reused by later arrivals. Adjacent wagons are told apart by alternating
-fill shade plus a border rather than by a gap.
+Parked resources are compacted **per frame** so wagons stay hole-free: the
+present occupants of a track are packed flush from the far (right) end as a
+LIFO stack (earliest arrival deepest, newest at the throat). Locomotives are
+coupled to the wagons they haul and the consist travels as one rigid, spaced
+train with the loco on the throat side. Wagons are sized by their real length;
+adjacent wagons are told apart by alternating fill shade plus a border.
 """
 
 from __future__ import annotations
@@ -34,28 +26,32 @@ from typing import Any
 import pandas as pd
 
 from dashboard_components import routes_graph as rg
+from dashboard_components.animation_layout import LANE_SPACING
+from dashboard_components.animation_layout import MAINLINE_DRAWN_M
+from dashboard_components.animation_layout import MIN_TRACK_LEN_M
+from dashboard_components.animation_layout import THROAT_X
+from dashboard_components.animation_layout import TRACK_TYPE_COLORS
+from dashboard_components.animation_layout import TRACK_TYPE_ORDER
+from dashboard_components.animation_layout import TrackLayout
+from dashboard_components.animation_layout import YardLayout
+from dashboard_components.animation_layout import build_layout
 
-# --- Visual constants (mirrors scenario_tab for consistency) ----------------
-
-TRACK_TYPE_ORDER: list[str] = [
-    'mainline',
-    'collection',
-    'retrofit',
-    'workshop',
-    'retrofitted',
-    'parking',
-    'rescource_parking',
+__all__ = [
+    'LANE_SPACING',
+    'MAINLINE_DRAWN_M',
+    'MIN_TRACK_LEN_M',
+    'THROAT_X',
+    'TRACK_TYPE_COLORS',
+    'TRACK_TYPE_ORDER',
+    'TrackLayout',
+    'YardLayout',
+    'active_track_ids',
+    'build_frames',
+    'build_layout',
+    'extract_timelines',
+    'rejected_times',
+    'wagon_lengths',
 ]
-
-TRACK_TYPE_COLORS: dict[str, str] = {
-    'collection': '#e74c3c',
-    'retrofit': '#f39c12',
-    'workshop': '#27ae60',
-    'retrofitted': '#9b59b6',
-    'parking': '#34495e',
-    'mainline': '#95a5a6',
-    'rescource_parking': '#7f8c8d',
-}
 
 WAGON_COLOR_PENDING: str = '#0072B2'  # blue (Okabe-Ito): not yet retrofitted
 WAGON_COLOR_DONE: str = '#009E73'  # green (Okabe-Ito): retrofitted
@@ -65,17 +61,6 @@ LOCO_COLOR: str = '#2c3e50'  # dark slate, distinct from wagons
 # countable. Index 0 is the base colour; index 1 is a lighter sibling.
 WAGON_SHADES_PENDING: tuple[str, str] = ('#0072B2', '#56B4E9')  # blue / sky-blue
 WAGON_SHADES_DONE: tuple[str, str] = ('#009E73', '#66C2A5')  # green / light green
-
-# Track types that pack from the far end (furthest from the throat) inward.
-STORAGE_TYPES: frozenset[str] = frozenset({'collection', 'parking', 'retrofitted', 'rescource_parking'})
-
-# Geometry. The x-axis is in metres along the track; the throat sits at x = 0.
-# (The y-axis is a lane index, so rectangle *height* is rendered nominally by
-# the view layer for visibility, while rectangle *length* is true-to-metre.)
-THROAT_X: float = 0.0
-LANE_SPACING: float = 1.0
-MIN_TRACK_LEN_M: float = 40.0  # floor so very short tracks stay visible
-MAINLINE_DRAWN_M: float = 300.0  # mainline is transit-only; not drawn to scale
 
 # Resource dimensions (metres).
 DEFAULT_WAGON_LENGTH_M: float = 16.0
@@ -90,41 +75,12 @@ UNIFORM_GAP_M: float = 0.0
 # record arrivals via ``previous_location`` but no move-start row).
 DEFAULT_TRANSIT_MIN: float = 12.0
 
-
-# --- Layout model -----------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class TrackLayout:  # pylint: disable=too-many-instance-attributes
-    """Geometry for a single track lane in the schematic yard."""
-
-    track_id: str
-    track_type: str
-    lane_y: float
-    x_start: float
-    x_end: float
-    length_m: float
-    color: str
-    is_workshop: bool = False
-    bays: int | None = None
-    cluster: str = 'local'
-    throat_x: float = 0.0  # x of the connecting (ladder) end of the track
-    zone: str = 'single'  # 'single' | 'left' | 'middle' | 'right'
-
-
-@dataclass(frozen=True)
-class YardLayout:  # pylint: disable=too-many-instance-attributes
-    """Full schematic layout: track lanes plus connecting throat(s)."""
-
-    tracks: dict[str, TrackLayout]
-    throat_x: float
-    x_max: float
-    y_min: float
-    y_max: float
-    mode: str = 'single'  # 'single' (one vertical throat) | 'zones' (left/Mainline/right)
-    left_throat_x: float = 0.0
-    right_throat_x: float = 0.0
-    corridor_y: float = 0.0
+# When inferring which wagons a locomotive hauls, a wagon's transit is matched
+# to a loco move on the same from->to whose timing is within this tolerance
+# (simulation minutes). The loco and wagon event logs use slightly different
+# conventions (the loco logs arrival where the wagon logs departure), so a few
+# minutes of slack is needed.
+CONSIST_MATCH_TOL_MIN: float = 30.0
 
 
 # --- Resource timeline model ------------------------------------------------
@@ -167,6 +123,26 @@ class ResourceTrack:  # pylint: disable=too-many-instance-attributes
     last_seen: float = 0.0
 
 
+@dataclass
+class ConsistLeg:
+    """One transport leg: a locomotive coupled to a rake of wagons.
+
+    ``car_ids`` / ``car_lengths`` are ordered front-to-back, loco first (it
+    always leads at the throat side); the loco's ``loco_move`` carries the
+    shared window, route and anchored endpoints. Used to render the consist as
+    one rigid train along the route so cars keep their spacing instead of
+    converging over the long mainline run.
+    """
+
+    loco_id: str
+    car_ids: list[str]
+    car_lengths: list[float]
+    t_depart: float
+    t_arrive: float
+    loco_move: Move
+    car_moves: list[Move] = field(default_factory=list)
+
+
 # --- Frame model ------------------------------------------------------------
 
 
@@ -198,219 +174,6 @@ class FrameData:  # pylint: disable=too-many-instance-attributes
     loco_len: list[float]
     loco_ids: list[str]
     stats: FrameStats
-
-
-# === Yard layout ============================================================
-
-
-def _natural_key(track_id: str) -> tuple[str, int]:
-    """Return a sort key that orders ``parking2`` before ``parking10``."""
-    digits = ''.join(ch for ch in track_id if ch.isdigit())
-    prefix = ''.join(ch for ch in track_id if not ch.isdigit())
-    return (prefix, int(digits) if digits else 0)
-
-
-def _edge_length(topology: dict[str, Any], edges: list[str]) -> float:
-    """Sum the lengths of the given topology edges (0.0 if unknown)."""
-    edge_map = topology.get('edges', {}) if topology else {}
-    total = 0.0
-    for edge in edges:
-        info = edge_map.get(edge)
-        if isinstance(info, dict) and 'length' in info:
-            total += float(info['length'])
-    return total
-
-
-def _resolve_track_meta(
-    track_id: str,
-    tracks_by_id: dict[str, dict[str, Any]],
-    topology: dict[str, Any],
-    bays_by_id: dict[str, int],
-    default_ws_len: float,
-) -> tuple[str, float, int | None]:
-    """Resolve (track_type, length_m, bays) for a track id, robust to id drift.
-
-    Handles scenarios where the runtime/route id (e.g. workshop ``WS_01``) does
-    not match the ``tracks.json`` id (``WS1``): such ids fall back to the
-    workshop config for type/bays and a default workshop length.
-    """
-    if track_id in tracks_by_id:
-        track = tracks_by_id[track_id]
-        track_type = str(track.get('type', 'parking'))
-        length_m = _edge_length(topology, track.get('edges', [track_id]))
-        bays = bays_by_id.get(track_id) if track_type == 'workshop' else None
-        return track_type, length_m, bays
-    if track_id in bays_by_id:  # a workshop id with no matching track entry
-        return 'workshop', default_ws_len, bays_by_id[track_id]
-    if track_id == rg.MAINLINE:
-        return 'mainline', _edge_length(topology, [track_id]), None
-    return 'parking', _edge_length(topology, [track_id]) or MIN_TRACK_LEN_M, None
-
-
-def build_layout(  # pylint: disable=too-many-locals
-    tracks_config: list[dict[str, Any]],
-    topology: dict[str, Any],
-    workshops_config: list[dict[str, Any]] | None = None,
-    route_graph: rg.RouteGraph | None = None,
-    active_ids: list[str] | None = None,
-) -> YardLayout:
-    """Build a schematic yard layout from scenario configuration.
-
-    Lanes are grouped top-to-bottom by connectivity cluster (remote / arrival
-    side on top, the ``Mainline`` spine in the middle, the local retrofit yard
-    below) and then by :data:`TRACK_TYPE_ORDER` and natural id. When no
-    ``route_graph`` is given every track is treated as ``local`` so the ordering
-    reduces to the original type-based layout. The x-axis is metric: each track
-    spans ``[0, length_m]`` metres from the throat; the mainline is transit-only
-    and drawn at a fixed (non-scaled) length.
-
-    ``active_ids`` (when given) selects which tracks to lay out — typically the
-    union of ids referenced by routes and the event logs — so runtime ids that
-    differ from ``tracks.json`` (e.g. workshop ``WS_01`` vs ``WS1``) still render.
-    """
-    workshops_config = workshops_config or []
-    tracks_by_id = {str(t['id']): t for t in tracks_config}
-    bays_by_id = {str(s['id']): int(s.get('retrofit_stations', 0)) for s in workshops_config if s.get('id')}
-    ws_lengths = [
-        _edge_length(topology, t.get('edges', [t['id']])) for t in tracks_config if t.get('type') == 'workshop'
-    ]
-    default_ws_len = max((length for length in ws_lengths if length > 0), default=260.0)
-
-    ids = active_ids if active_ids else [str(t['id']) for t in tracks_config]
-    cluster_of = route_graph.cluster if route_graph else {}
-
-    enriched: list[dict[str, Any]] = []
-    for track_id in dict.fromkeys(ids):  # de-duplicate, preserve order
-        track_type, length_m, bays = _resolve_track_meta(track_id, tracks_by_id, topology, bays_by_id, default_ws_len)
-        enriched.append(
-            {
-                'id': track_id,
-                'type': track_type,
-                'length_m': length_m,
-                'bays': bays,
-                'cluster': cluster_of.get(track_id, 'local'),
-            }
-        )
-
-    if route_graph is not None and any(t['cluster'] == 'remote' for t in enriched):
-        return _layout_zones(enriched)
-    return _layout_single(enriched)
-
-
-def _order_index(track_type: str) -> int:
-    """Return the top-to-bottom rank of a track type."""
-    return TRACK_TYPE_ORDER.index(track_type) if track_type in TRACK_TYPE_ORDER else len(TRACK_TYPE_ORDER)
-
-
-def _drawn_len(track_type: str, length_m: float) -> float:
-    """Return the drawn x-extent (metres) of a track (mainline is fixed)."""
-    return MAINLINE_DRAWN_M if track_type == 'mainline' else max(MIN_TRACK_LEN_M, length_m)
-
-
-def _make_track(
-    track: dict[str, Any], lane_y: float, x_range: tuple[float, float], throat_x: float, zone: str
-) -> TrackLayout:
-    """Build a TrackLayout from an enriched track dict and geometry."""
-    track_type = track['type']
-    return TrackLayout(
-        track_id=track['id'],
-        track_type=track_type,
-        lane_y=lane_y,
-        x_start=x_range[0],
-        x_end=x_range[1],
-        length_m=track['length_m'],
-        color=TRACK_TYPE_COLORS.get(track_type, '#7f7f7f'),
-        is_workshop=track_type == 'workshop',
-        bays=track['bays'],
-        cluster=track['cluster'],
-        throat_x=throat_x,
-        zone=zone,
-    )
-
-
-def _layout_single(enriched: list[dict[str, Any]]) -> YardLayout:
-    """Lay out all tracks as a single vertically-stacked column (legacy)."""
-    enriched.sort(key=lambda t: (rg.CLUSTER_RANK.get(t['cluster'], 2), _order_index(t['type']), _natural_key(t['id'])))
-    n_lanes = len(enriched)
-    tracks: dict[str, TrackLayout] = {}
-    for index, track in enumerate(enriched):
-        drawn = _drawn_len(track['type'], track['length_m'])
-        tracks[track['id']] = _make_track(
-            track, (n_lanes - 1 - index) * LANE_SPACING, (THROAT_X, THROAT_X + drawn), THROAT_X, 'single'
-        )
-    y_values = [t.lane_y for t in tracks.values()] or [0.0]
-    x_values = [t.x_end for t in tracks.values()] or [MAINLINE_DRAWN_M]
-    return YardLayout(
-        tracks=tracks,
-        throat_x=THROAT_X,
-        x_max=max(x_values),
-        y_min=min(y_values),
-        y_max=max(y_values),
-        mode='single',
-        left_throat_x=THROAT_X,
-    )
-
-
-def _layout_zones(enriched: list[dict[str, Any]]) -> YardLayout:  # pylint: disable=too-many-locals
-    """Lay out tracks in three columns: local yard | Mainline | remote storage.
-
-    The local yard sits on the left (ladder on its right edge), the Mainline is
-    a fixed-width corridor in the middle (<=25% of the width), and the remote
-    storage sits on the right (ladder on its left edge). Cross-zone moves pass
-    through the Mainline corridor.
-    """
-    left = sorted(
-        (t for t in enriched if t['type'] != 'mainline' and t['cluster'] in ('local', 'hub')),
-        key=lambda t: (_order_index(t['type']), _natural_key(t['id'])),
-    )
-    right = sorted(
-        (t for t in enriched if t['type'] != 'mainline' and t['cluster'] == 'remote'),
-        key=lambda t: (_order_index(t['type']), _natural_key(t['id'])),
-    )
-    middle = [t for t in enriched if t['type'] == 'mainline']
-
-    left_w = max((_drawn_len(t['type'], t['length_m']) for t in left), default=MIN_TRACK_LEN_M)
-    right_w = max((_drawn_len(t['type'], t['length_m']) for t in right), default=MIN_TRACK_LEN_M)
-    middle_w = (left_w + right_w) / 3.0  # exactly 25% of total width
-    left_throat = left_w
-    right_throat = left_w + middle_w
-    total_w = left_w + middle_w + right_w
-    n_lanes = max(len(left), len(right), 1)
-    corridor_y = (n_lanes - 1) / 2.0 * LANE_SPACING
-
-    tracks: dict[str, TrackLayout] = {}
-
-    def lane_for(group: list[dict[str, Any]], index: int) -> float:
-        offset = (n_lanes - len(group)) / 2.0  # vertically centre the shorter column
-        return (n_lanes - 1 - index - offset) * LANE_SPACING
-
-    for index, track in enumerate(left):
-        drawn = _drawn_len(track['type'], track['length_m'])
-        tracks[track['id']] = _make_track(
-            track, lane_for(left, index), (left_throat - drawn, left_throat), left_throat, 'left'
-        )
-    for index, track in enumerate(right):
-        drawn = _drawn_len(track['type'], track['length_m'])
-        tracks[track['id']] = _make_track(
-            track, lane_for(right, index), (right_throat, right_throat + drawn), right_throat, 'right'
-        )
-    for track in middle:
-        tracks[track['id']] = _make_track(
-            track, corridor_y, (left_throat, right_throat), (left_throat + right_throat) / 2.0, 'middle'
-        )
-
-    y_values = [t.lane_y for t in tracks.values()] or [0.0]
-    return YardLayout(
-        tracks=tracks,
-        throat_x=left_throat,
-        x_max=total_w,
-        y_min=min(y_values),
-        y_max=max(y_values),
-        mode='zones',
-        left_throat_x=left_throat,
-        right_throat_x=right_throat,
-        corridor_y=corridor_y,
-    )
 
 
 # === Movement-segment extraction ============================================
@@ -476,11 +239,14 @@ def wagon_lengths(train_schedule: pd.DataFrame | None) -> dict[str, float]:
 
 
 def rejected_times(rejected_wagons: pd.DataFrame | None) -> list[float]:
-    """Return sorted rejection timestamps (minutes) from the rejected-wagons log."""
+    """Return sorted rejection timestamps (minutes) for TRACK_FULL rejections only."""
     if rejected_wagons is None or rejected_wagons.empty or 'timestamp' not in rejected_wagons.columns:
         return []
+    df = rejected_wagons
+    if 'rejection_type' in df.columns:
+        df = df[df['rejection_type'] == 'TRACK_FULL']
     times: list[float] = []
-    for value in rejected_wagons['timestamp']:
+    for value in df['timestamp']:
         try:
             times.append(float(value))
         except (ValueError, TypeError):
@@ -565,143 +331,184 @@ def extract_timelines(
 # === Stable position allocation =============================================
 
 
-def _merge_free(free: list[list[float]]) -> None:
-    """Merge adjacent free intervals (in place); each item is ``[start, len]``."""
-    free.sort()
-    merged: list[list[float]] = []
-    for start, length in free:
-        if merged and abs(merged[-1][0] + merged[-1][1] - start) < 1e-6:
-            merged[-1][1] += length
-        else:
-            merged.append([start, length])
-    free[:] = merged
+def _stack_centers(tl: TrackLayout, present: list[tuple[float, bool, str, float]]) -> dict[str, float]:
+    """Pack present resources flush from the far end (away from the throat) as a LIFO stack.
 
-
-def _assign_linear(  # pylint: disable=too-many-locals
-    tl: TrackLayout, items: list[tuple[float, float, float, Dwell]], gap: float
-) -> None:
-    """Assign fixed centres for a linear track via an event-driven allocator.
-
-    Each dwell reserves ``length + gap`` of axis space when it arrives (first
-    fit from the packing end) and frees it on departure, so parked resources
-    keep a constant position and adjacent ones sit flush (``gap`` defaults to 0).
-    Storage tracks pack from the outer (far) end; other tracks pack from the
-    throat. A trailing region absorbs any over-capacity overflow sequentially so
-    wagons never stack on the same coordinate. Works for any zone via the
-    track's ``throat_x`` / endpoints.
+    The earliest arrival sits deepest (against the far end); later arrivals — and
+    locomotives on an arrival tie — sit nearer the throat, where a loco couples.
+    There are never holes: the present set is re-packed every frame, so a
+    departure makes the rest slide flush toward the far end.
     """
-    track_len = tl.x_end - tl.x_start
-    outer_x = tl.x_start if abs(tl.throat_x - tl.x_end) < 1e-9 else tl.x_end
-    if tl.track_type in STORAGE_TYPES:
-        origin, direction = outer_x, (1.0 if tl.throat_x > outer_x else -1.0)
-    else:  # retrofit (and similar) pack from the throat
-        origin, direction = tl.throat_x, (1.0 if outer_x > tl.throat_x else -1.0)
-
-    events: list[tuple[float, int, int]] = []
-    for i, (t_arrive, t_depart, _length, _dwell) in enumerate(items):
-        events.append((t_arrive, 0, i))  # arrival (before departures at the same time)
-        events.append((t_depart, 1, i))  # departure
-    events.sort(key=lambda e: (e[0], e[1]))
-
-    # The second segment is an (effectively unbounded) overflow region so that
-    # over-capacity arrivals pack sequentially beyond the track instead of
-    # collapsing onto a single coordinate.
-    free: list[list[float]] = [[0.0, track_len], [track_len, track_len * 10.0 + 1000.0]]
-    alloc: dict[int, list[float]] = {}
-    for _time, kind, i in events:
-        _ta, _td, length, dwell = items[i]
-        need = length + gap
-        if kind == 0:
-            start = _first_fit(free, need, track_len)
-            alloc[i] = [start, need]
-            dwell.center_x = origin + direction * (start + length / 2.0)
-        elif i in alloc:
-            free.append(alloc.pop(i))
-            _merge_free(free)
+    order = sorted(present, key=lambda p: (p[0], p[1]))
+    centers: dict[str, float] = {}
+    # Determine packing direction: fill away from the throat toward the far end.
+    if abs(tl.throat_x - tl.x_end) < 1e-9:
+        # Throat is on the right edge (left-zone) → far end is x_start, fill rightward
+        x = tl.x_start
+        for _t_arrive, _is_loco, rid, length in order:
+            centers[rid] = x + length / 2.0
+            x += length + UNIFORM_GAP_M
+    else:
+        # Throat is on the left edge (right-zone / single) → far end is x_end, fill leftward
+        x = tl.x_end
+        for _t_arrive, _is_loco, rid, length in order:
+            centers[rid] = x - length / 2.0
+            x -= length + UNIFORM_GAP_M
+    return centers
 
 
-def _first_fit(free: list[list[float]], need: float, capacity: float) -> float:
-    """Return the start offset of the first free interval that fits ``need``."""
-    for seg in free:
-        if seg[1] >= need - 1e-9:
-            start = seg[0]
-            seg[0] += need
-            seg[1] -= need
-            return start
-    return capacity  # overflow: stack beyond the usable length (rare)
-
-
-def _peak_concurrency(events: list[tuple[float, int, int]]) -> int:
-    """Return the maximum number of simultaneously-present items over the events."""
-    current = peak = 0
-    for _time, kind, _i in events:
-        current += 1 if kind == 0 else -1
-        peak = max(peak, current)
-    return peak
-
-
-def _assign_workshop(tl: TrackLayout, items: list[tuple[float, float, float, Dwell]]) -> None:
-    """Assign fixed slot centres for a workshop, always inside the box.
-
-    There is one slot per retrofit bay; if more wagons are ever present at once
-    than there are bays, the box is divided into as many equal slots as the peak
-    occupancy so every wagon stays within ``[x_start, x_end]`` and none overlap.
-    Arrivals are processed before departures at tied timestamps so a momentary
-    (zero-duration) visit never leaks its slot.
-    """
-    events: list[tuple[float, int, int]] = []
-    for i, (t_arrive, t_depart, _length, _dwell) in enumerate(items):
-        events.append((t_arrive, 0, i))
-        events.append((t_depart, 1, i))
-    events.sort(key=lambda e: (e[0], e[1]))
-
-    n_slots = max(1, tl.bays or 1, _peak_concurrency(events))
+def _workshop_centers(tl: TrackLayout, present: list[tuple[float, bool, str, float]]) -> dict[str, float]:
+    """Place present workshop occupants in evenly-spaced bay slots inside the box."""
+    order = sorted(present, key=lambda p: (p[0], p[1]))
+    n_slots = max(1, tl.bays or 1, len(order))
     width = tl.x_end - tl.x_start
-    free_slots = list(range(n_slots))
-    assigned: dict[int, int] = {}
-    for _time, kind, i in events:
-        _ta, _td, _length, dwell = items[i]
-        if kind == 0:
-            slot = free_slots.pop(0) if free_slots else n_slots - 1
-            assigned[i] = slot
-            dwell.center_x = tl.x_start + width * (slot + 0.5) / n_slots
-        elif i in assigned:
-            free_slots.append(assigned.pop(i))
-            free_slots.sort()
+    return {rid: tl.x_start + width * (slot + 0.5) / n_slots for slot, (_ta, _lc, rid, _ln) in enumerate(order)}
 
 
-def _anchor_moves(timelines: dict[str, ResourceTrack]) -> None:
-    """Set each move's from/to anchor to its bracketing dwell centres."""
+def _centers_for(tl: TrackLayout | None, present: list[tuple[float, bool, str, float]]) -> dict[str, float]:
+    """Dispatch flush-stack vs workshop-slot packing for a track's occupants."""
+    if tl is None or not present:
+        return {}
+    if tl.is_workshop:
+        return _workshop_centers(tl, present)
+    return _stack_centers(tl, present)
+
+
+def _present_on(timelines: dict[str, ResourceTrack], track_id: str, t: float) -> list[tuple[float, bool, str, float]]:
+    """Return (t_arrive, is_loco, id, length) for resources parked on ``track_id`` at ``t``."""
+    present: list[tuple[float, bool, str, float]] = []
     for rt in timelines.values():
-        for i, move in enumerate(rt.moves):
-            move.anchor_from_x = rt.dwells[i].center_x
-            move.anchor_to_x = rt.dwells[i + 1].center_x
-
-
-def assign_positions(layout: YardLayout, timelines: dict[str, ResourceTrack], gap: float = UNIFORM_GAP_M) -> None:
-    """Assign a fixed centre to every dwell and anchor every move (in place).
-
-    Positions are computed once per dwell so a stationary resource never shifts.
-    """
-    per_track: dict[str, list[tuple[float, float, float, Dwell]]] = defaultdict(list)
-    for rt in timelines.values():
+        if t < rt.first_seen:
+            continue
         for dwell in rt.dwells:
-            per_track[dwell.track].append((dwell.t_arrive, dwell.t_depart, rt.length_m, dwell))
+            if dwell.track == track_id and dwell.t_arrive <= t <= dwell.t_depart:
+                present.append((dwell.t_arrive, rt.resource_type == 'locomotive', rt.resource_id, rt.length_m))
+                break
+    return present
 
-    for track_id, items in per_track.items():
-        tl = layout.tracks.get(track_id)
-        if tl is None:
-            for *_unused, dwell in items:
-                dwell.center_x = 0.0
-        elif tl.track_type == 'workshop':
-            _assign_workshop(tl, items)
-        elif tl.track_type in STORAGE_TYPES or tl.track_type == 'retrofit':
-            _assign_linear(tl, items, gap)
-        else:  # mainline / unknown: centre
-            for *_unused, dwell in items:
-                dwell.center_x = tl.x_end / 2.0
 
-    _anchor_moves(timelines)
+def _packed_centers(
+    layout: YardLayout, timelines: dict[str, ResourceTrack], track_id: str, t: float
+) -> dict[str, float]:
+    """Return {resource_id: center_x} for the resources parked on ``track_id`` at ``t``."""
+    return _centers_for(layout.tracks.get(track_id), _present_on(timelines, track_id, t))
+
+
+def _all_packed_centers(
+    layout: YardLayout, timelines: dict[str, ResourceTrack], t: float
+) -> dict[str, dict[str, float]]:
+    """Compute packed centres for every occupied track at ``t`` in a single scan."""
+    present_by_track: dict[str, list[tuple[float, bool, str, float]]] = defaultdict(list)
+    for rt in timelines.values():
+        if t < rt.first_seen:
+            continue
+        for dwell in rt.dwells:
+            if dwell.t_arrive <= t <= dwell.t_depart:
+                present_by_track[dwell.track].append(
+                    (dwell.t_arrive, rt.resource_type == 'locomotive', rt.resource_id, rt.length_m)
+                )
+                break
+    return {track: _centers_for(layout.tracks.get(track), items) for track, items in present_by_track.items()}
+
+
+def _mid_x(layout: YardLayout, track_id: str) -> float:
+    """Return a track's mid-x fallback (used when a resource is not found parked)."""
+    tl = layout.tracks.get(track_id)
+    return (tl.x_start + tl.x_end) / 2.0 if tl is not None else 0.0
+
+
+def _anchor_moves(layout: YardLayout, timelines: dict[str, ResourceTrack]) -> None:
+    """Anchor each move to the resource's compacted slot at its endpoints (in place)."""
+    for rt in timelines.values():
+        for move in rt.moves:
+            from_centers = _packed_centers(layout, timelines, move.from_track, move.t_depart)
+            to_centers = _packed_centers(layout, timelines, move.to_track, move.t_arrive)
+            move.anchor_from_x = from_centers.get(rt.resource_id, _mid_x(layout, move.from_track))
+            move.anchor_to_x = to_centers.get(rt.resource_id, _mid_x(layout, move.to_track))
+
+
+def _best_loco_move(wm: Move, candidates: list[tuple[str, int, Move]]) -> tuple[str, int] | None:
+    """Return the (loco_id, move_index) best matching a wagon move, or None."""
+    best_key: tuple[str, int] | None = None
+    best_dist = CONSIST_MATCH_TOL_MIN
+    for loco_id, index, lm in candidates:
+        if lm.from_track != wm.from_track or lm.to_track != wm.to_track:
+            continue
+        dist = min(abs(lm.t_arrive - wm.t_depart), abs(lm.t_depart - wm.t_depart), abs(lm.t_arrive - wm.t_arrive))
+        if dist <= best_dist:
+            best_key, best_dist = (loco_id, index), dist
+    return best_key
+
+
+def infer_consists(timelines: dict[str, ResourceTrack]) -> dict[str, list[ConsistLeg]]:  # pylint: disable=too-many-locals
+    """Couple wagons to the locomotive that hauls them and synchronise motion (in place).
+
+    No data source links a wagon to its loco, so each loco move is matched to the
+    wagons departing the same ``from->to`` at a close time (see
+    :data:`CONSIST_MATCH_TOL_MIN`). For a matched leg the loco move (and its
+    bracketing dwells) is snapped to the rake's window and route — the wagon data
+    is trusted — so the loco and its wagons travel together. Returns the consist
+    legs keyed by every member resource id; unmatched (empty) loco trips produce
+    no leg.
+    """
+    locos = [rt for rt in timelines.values() if rt.resource_type == 'locomotive']
+    wagons = [rt for rt in timelines.values() if rt.resource_type != 'locomotive']
+    by_key: dict[tuple[str, int], tuple[ResourceTrack, Move]] = {}
+    candidates: list[tuple[str, int, Move]] = []
+    for loco in locos:
+        for index, lm in enumerate(loco.moves):
+            by_key[(loco.resource_id, index)] = (loco, lm)
+            candidates.append((loco.resource_id, index, lm))
+
+    rakes: dict[tuple[str, int], list[tuple[ResourceTrack, int, Move]]] = defaultdict(list)
+    for wagon in wagons:
+        for widx, wm in enumerate(wagon.moves):
+            key = _best_loco_move(wm, candidates)
+            if key is not None:
+                rakes[key].append((wagon, widx, wm))
+
+    legs_by_resource: dict[str, list[ConsistLeg]] = defaultdict(list)
+    for key, members in rakes.items():
+        leg = _build_leg(by_key[key], key[1], members)
+        legs_by_resource[leg.loco_id].append(leg)
+        for car_id in leg.car_ids[1:]:
+            legs_by_resource[car_id].append(leg)
+    return dict(legs_by_resource)
+
+
+def _build_leg(
+    loco_move: tuple[ResourceTrack, Move], index: int, members: list[tuple[ResourceTrack, int, Move]]
+) -> ConsistLeg:
+    """Snap a loco move to its rake's window/route and return the consist leg."""
+    loco, lm = loco_move
+    dep = min(wm.t_depart for _w, _i, wm in members)
+    arr = max(wm.t_arrive for _w, _i, wm in members)
+    lm.t_depart, lm.t_arrive = dep, arr
+    lm.route = members[0][2].route or lm.route
+    if index < len(loco.dwells):
+        loco.dwells[index].t_depart = dep
+    if index + 1 < len(loco.dwells):
+        loco.dwells[index + 1].t_arrive = arr
+    # Order wagons newest-first: the latest source arrival sits closest to the
+    # loco (the throat side), matching the flush-stack packing.
+    ordered = sorted(members, key=lambda m: m[0].dwells[m[1]].t_arrive, reverse=True)
+    car_ids = [loco.resource_id, *[w.resource_id for w, _i, _wm in ordered]]
+    car_lengths = [loco.length_m, *[w.length_m for w, _i, _wm in ordered]]
+    car_moves = [lm, *[wm for _w, _i, wm in ordered]]
+    return ConsistLeg(loco.resource_id, car_ids, car_lengths, dep, arr, lm, car_moves)
+
+
+def assign_positions(layout: YardLayout, timelines: dict[str, ResourceTrack]) -> dict[str, list[ConsistLeg]]:
+    """Infer loco/wagon consists, anchor every move, and return the consist legs.
+
+    Parked positions are *not* precomputed: they are compacted per frame (see
+    :func:`_all_packed_centers`) so wagons stay hole-free and slide as neighbours
+    leave. Only move endpoints are anchored here, to the compacted slot the
+    resource occupies at departure / arrival.
+    """
+    legs = infer_consists(timelines)
+    _anchor_moves(layout, timelines)
+    return legs
 
 
 # === Position resolver ======================================================
@@ -719,6 +526,8 @@ def _move_waypoints(layout: YardLayout, move: Move) -> list[tuple[float, float]]
     b = layout.tracks.get(move.to_track)
     lane_from = a.lane_y if a is not None else 0.0
     lane_to = b.lane_y if b is not None else 0.0
+    throat_a = a.throat_x if a is not None else layout.throat_x
+    throat_b = b.throat_x if b is not None else layout.throat_x
     start = (move.anchor_from_x, lane_from)
     end = (move.anchor_to_x, lane_to)
 
@@ -731,15 +540,15 @@ def _move_waypoints(layout: YardLayout, move: Move) -> list[tuple[float, float]]
         points.append(end)
         return points
 
-    points = [start, (a.throat_x, lane_from)]
+    points = [start, (throat_a, lane_from)]
     if a.zone == b.zone:
-        points.append((a.throat_x, lane_to))
+        points.append((throat_a, lane_to))
     else:  # cross-zone: traverse the Mainline corridor between the two ladders
         points.extend(
             [
-                (a.throat_x, layout.corridor_y),
-                (b.throat_x, layout.corridor_y),
-                (b.throat_x, lane_to),
+                (throat_a, layout.corridor_y),
+                (throat_b, layout.corridor_y),
+                (throat_b, lane_to),
             ]
         )
     points.append(end)
@@ -767,27 +576,97 @@ def _interp_path(points: list[tuple[float, float]], frac: float) -> tuple[float,
     return points[-1]
 
 
-def position_at(rt: ResourceTrack, layout: YardLayout, t: float) -> tuple[float, float] | None:
-    """Resolve a resource's (x, y) centre at simulation time ``t``.
+def _path_length(points: list[tuple[float, float]]) -> float:
+    """Return the total arc length of a polyline."""
+    return sum(math.dist(points[i], points[i + 1]) for i in range(len(points) - 1))
 
-    Returns ``None`` before the resource first appears. While stationary it sits
-    at its fixed dwell centre; while moving it is interpolated along its route.
-    Requires :func:`assign_positions` to have been run on ``timelines``.
+
+def _car_offset(leg: ConsistLeg, idx: int) -> float:
+    """Centre-to-centre arc distance from the loco (index 0) to car ``idx``."""
+    if idx <= 0:
+        return 0.0
+    off = leg.car_lengths[0] / 2.0 + leg.car_lengths[idx] / 2.0
+    for j in range(1, idx):
+        off += leg.car_lengths[j]
+    return off
+
+
+def _covering_leg(legs: list[ConsistLeg] | None, t: float) -> ConsistLeg | None:
+    """Return the consist leg whose window contains ``t`` (or None)."""
+    if not legs:
+        return None
+    for leg in legs:
+        if leg.t_depart <= t <= leg.t_arrive:
+            return leg
+    return None
+
+
+def _consist_position(leg: ConsistLeg, idx: int, layout: YardLayout, t: float) -> tuple[float, float]:
+    """Position car ``idx`` of a consist as part of one rigid, spaced train.
+
+    Every car follows its **own** route (its own compacted source/dest slots),
+    sharing a single progress lagged by the car's offset behind the loco —
+    expressed as a fraction of the loco's path so cars on slightly different-
+    length paths stay evenly spaced. The loco leads out and settles at its
+    throat-side slot first; each wagon tucks into its own (deeper) slot, so the
+    train keeps its spacing over the long mainline run yet lands flush at both
+    ends with no holes and no overlap.
     """
+    move = leg.car_moves[idx] if idx < len(leg.car_moves) else leg.loco_move
+    path = _move_waypoints(layout, move)
+    ref_len = _path_length(_move_waypoints(layout, leg.loco_move)) or 1.0
+    off_frac = _car_offset(leg, idx) / ref_len
+    tail_frac = _car_offset(leg, len(leg.car_ids) - 1) / ref_len
+    denom = leg.t_arrive - leg.t_depart
+    raw = 0.0 if denom <= 0 else min(1.0, max(0.0, (t - leg.t_depart) / denom))
+    progress = raw * (1.0 + tail_frac)
+    return _interp_path(path, min(1.0, max(0.0, progress - off_frac)))
+
+
+def _resolve_position(
+    rt: ResourceTrack,
+    layout: YardLayout,
+    centers: dict[str, dict[str, float]],
+    legs: dict[str, list[ConsistLeg]],
+    t: float,
+) -> tuple[float, float] | None:
+    """Resolve a resource's (x, y) using per-frame packed ``centers`` and consist ``legs``."""
     if t < rt.first_seen:
         return None
     for dwell in rt.dwells:
-        if dwell.track in layout.tracks and dwell.t_arrive <= t <= dwell.t_depart:
-            return (dwell.center_x, layout.tracks[dwell.track].lane_y)
+        if dwell.t_arrive <= t <= dwell.t_depart:
+            tl = layout.tracks.get(dwell.track)
+            if tl is None:
+                return None
+            cx = centers.get(dwell.track, {}).get(rt.resource_id)
+            return (cx if cx is not None else _mid_x(layout, dwell.track), tl.lane_y)
     for move in rt.moves:
         if move.t_depart <= t <= move.t_arrive:
+            leg = _covering_leg(legs.get(rt.resource_id), t)
+            if leg is not None:
+                return _consist_position(leg, leg.car_ids.index(rt.resource_id), layout, t)
             denom = move.t_arrive - move.t_depart
             frac = 0.0 if denom <= 0 else (t - move.t_depart) / denom
             return _interp_path(_move_waypoints(layout, move), frac)
-    last = rt.dwells[-1]
-    if last.track in layout.tracks:
-        return (last.center_x, layout.tracks[last.track].lane_y)
     return None
+
+
+def position_at(
+    rt: ResourceTrack,
+    layout: YardLayout,
+    timelines: dict[str, ResourceTrack],
+    t: float,
+    legs: dict[str, list[ConsistLeg]] | None = None,
+) -> tuple[float, float] | None:
+    """Resolve a resource's (x, y) centre at simulation time ``t``.
+
+    Returns ``None`` before the resource first appears. While parked it sits at
+    its compacted (hole-free, flush-right) slot among co-present resources; while
+    moving it follows its route — as part of a rigid consist when ``legs`` says
+    so. Requires :func:`assign_positions` to have been run on ``timelines`` (pass
+    its returned ``legs`` for coupled movement).
+    """
+    return _resolve_position(rt, layout, _all_packed_centers(layout, timelines, t), legs or {}, t)
 
 
 # === Frame builder ==========================================================
@@ -890,11 +769,14 @@ def _frame_stats(  # pylint: disable=too-many-locals
     )
 
 
-def _collect_frame_arrays(layout: YardLayout, timelines: dict[str, ResourceTrack], t: float) -> dict[str, list[Any]]:
+def _collect_frame_arrays(
+    layout: YardLayout, timelines: dict[str, ResourceTrack], legs: dict[str, list[ConsistLeg]], t: float
+) -> dict[str, list[Any]]:
     """Accumulate per-resource rectangle arrays for a single frame."""
     acc = _empty_acc()
+    centers = _all_packed_centers(layout, timelines, t)
     for rt in timelines.values():
-        pos = position_at(rt, layout, t)
+        pos = _resolve_position(rt, layout, centers, legs, t)
         if pos is None:
             continue
         if rt.resource_type == 'locomotive':
@@ -911,18 +793,23 @@ def _collect_frame_arrays(layout: YardLayout, timelines: dict[str, ResourceTrack
     return acc
 
 
-def _build_one_frame(
-    layout: YardLayout,
-    timelines: dict[str, ResourceTrack],
-    t: float,
-    t_start: float,
-    rejected_at: list[float],
-) -> FrameData:
+@dataclass(frozen=True)
+class _FrameInputs:
+    """Shared inputs for building every frame of one animation."""
+
+    layout: YardLayout
+    timelines: dict[str, ResourceTrack]
+    legs: dict[str, list[ConsistLeg]]
+    rejected_at: list[float]
+    t_start: float
+
+
+def _build_one_frame(inputs: _FrameInputs, t: float) -> FrameData:
     """Assemble a single :class:`FrameData` (rectangles + shades + stats) at ``t``."""
-    acc = _collect_frame_arrays(layout, timelines, t)
+    acc = _collect_frame_arrays(inputs.layout, inputs.timelines, inputs.legs, t)
     return FrameData(
         t=t,
-        datetime_label=_format_time(t_start, t),
+        datetime_label=_format_time(inputs.t_start, t),
         wagon_x=acc['wagon_x'],
         wagon_y=acc['wagon_y'],
         wagon_len=acc['wagon_len'],
@@ -933,7 +820,7 @@ def _build_one_frame(
         loco_y=acc['loco_y'],
         loco_len=acc['loco_len'],
         loco_ids=acc['loco_ids'],
-        stats=_frame_stats(layout, timelines, t, rejected_at),
+        stats=_frame_stats(inputs.layout, inputs.timelines, t, inputs.rejected_at),
     )
 
 
@@ -954,16 +841,15 @@ def build_frames(
     """
     if not timelines or num_frames < 1:
         return []
-    assign_positions(layout, timelines)
-    rejected_at = rejected_at or []
+    legs = assign_positions(layout, timelines)
     t_start, t_end = bounds if bounds is not None else sim_time_bounds(timelines)
     span = t_end - t_start
+    inputs = _FrameInputs(layout, timelines, legs, rejected_at or [], t_start)
 
     frames: list[FrameData] = []
     for index in range(num_frames):
         frac = 0.0 if num_frames == 1 else index / (num_frames - 1)
-        t = t_start + frac * span
-        frames.append(_build_one_frame(layout, timelines, t, t_start, rejected_at))
+        frames.append(_build_one_frame(inputs, t_start + frac * span))
     return frames
 
 

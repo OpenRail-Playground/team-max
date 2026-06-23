@@ -1,7 +1,9 @@
 """Unit tests for the animation data transforms (animation_data.py).
 
 These tests use small synthetic event logs mirroring the real
-``resource_locations`` / ``resource_states`` shape (see wagon W0001 trace).
+``resource_locations`` / ``resource_states`` shape. They cover the left-throat
+two-zone layout (with a bottom mainline corridor), the per-frame stack (LIFO)
+compaction, and loco/wagon consist coupling.
 """
 
 import itertools
@@ -52,7 +54,7 @@ def workshops_config() -> list[dict]:
 
 @pytest.fixture
 def layout(tracks_config, topology, workshops_config) -> ad.YardLayout:
-    """Return a built yard layout for the synthetic config."""
+    """Return a built yard layout for the synthetic config (no routes -> single zone)."""
     return ad.build_layout(tracks_config, topology, workshops_config)
 
 
@@ -158,16 +160,9 @@ def loco_locations() -> pd.DataFrame:
     )
 
 
-def _two_wagons(track: str, len_a: float, len_b: float, depart_b: float = 100.0) -> dict[str, ad.ResourceTrack]:
-    """Build two concurrent wagons dwelling on a track from t=0."""
-    rt_a = ad.ResourceTrack('A', 'wagon', length_m=len_a, dwells=[ad.Dwell(track, 0.0, 200.0)])
-    rt_b = ad.ResourceTrack('B', 'wagon', length_m=len_b, dwells=[ad.Dwell(track, 0.0, depart_b)])
-    return {'A': rt_a, 'B': rt_b}
-
-
-def _one_track_layout(track_type: str, length: float, bays: int | None = None) -> ad.YardLayout:
-    """Build a single-track yard layout (throat at x=0) for allocator tests."""
-    tl = ad.TrackLayout(
+def _track_layout(track_type: str, length: float, bays: int | None = None) -> ad.TrackLayout:
+    """Build a single left-throat TrackLayout (throat at x=0, extends right)."""
+    return ad.TrackLayout(
         track_id='T',
         track_type=track_type,
         lane_y=0.0,
@@ -178,28 +173,39 @@ def _one_track_layout(track_type: str, length: float, bays: int | None = None) -
         is_workshop=track_type == 'workshop',
         bays=bays,
         throat_x=0.0,
-        zone='single',
+        zone='local',
     )
+
+
+def _one_track_layout(track_type: str, length: float, bays: int | None = None) -> ad.YardLayout:
+    """Build a single-track yard layout for compaction tests."""
     return ad.YardLayout(
-        tracks={'T': tl}, throat_x=0.0, x_max=length, y_min=0.0, y_max=0.0, mode='single', left_throat_x=0.0
+        tracks={'T': _track_layout(track_type, length, bays)},
+        throat_x=0.0,
+        x_max=length,
+        y_min=0.0,
+        y_max=0.0,
+        mode='single',
+        left_throat_x=0.0,
     )
 
 
-def _n_wagons(track: str, n: int, length: float) -> dict[str, ad.ResourceTrack]:
-    """Build ``n`` concurrent wagons dwelling on ``track`` from t=0."""
-    return {
-        f'W{i}': ad.ResourceTrack(f'W{i}', 'wagon', length_m=length, dwells=[ad.Dwell(track, 0.0, 200.0)])
-        for i in range(n)
-    }
+def _wagons(track: str, specs: list[tuple[str, float, float, float]]) -> dict[str, ad.ResourceTrack]:
+    """Build wagons on ``track`` from (id, length, t_arrive, t_depart) specs."""
+    timelines: dict[str, ad.ResourceTrack] = {}
+    for rid, length, t_arrive, t_depart in specs:
+        rt = ad.ResourceTrack(rid, 'wagon', length_m=length, dwells=[ad.Dwell(track, t_arrive, t_depart)])
+        rt.first_seen = t_arrive
+        timelines[rid] = rt
+    return timelines
 
 
-def _intervals_on(timelines: dict[str, ad.ResourceTrack], track: str, t: float) -> list[tuple[float, float]]:
-    """Return sorted (start, end) x-extents of wagons present on ``track`` at ``t``."""
-    spans: list[tuple[float, float]] = []
-    for rt in timelines.values():
-        for dwell in rt.dwells:
-            if dwell.track == track and dwell.t_arrive <= t <= dwell.t_depart:
-                spans.append((dwell.center_x - rt.length_m / 2.0, dwell.center_x + rt.length_m / 2.0))
+def _intervals(
+    layout: ad.YardLayout, timelines: dict[str, ad.ResourceTrack], track: str, t: float
+) -> list[tuple[float, float]]:
+    """Return sorted (start, end) x-extents of resources packed on ``track`` at ``t``."""
+    centers = ad._packed_centers(layout, timelines, track, t)
+    spans = [(cx - timelines[rid].length_m / 2.0, cx + timelines[rid].length_m / 2.0) for rid, cx in centers.items()]
     return sorted(spans)
 
 
@@ -248,11 +254,6 @@ class TestExtractTimelines:
         rt = ad.extract_timelines(w0001_locations, w0001_states, lengths)['W0001']
         assert rt.length_m == pytest.approx(15.9)
 
-    def test_wagon_length_falls_back_to_default(self, w0001_locations, w0001_states):
-        """Without a schedule entry the wagon length defaults."""
-        rt = ad.extract_timelines(w0001_locations, w0001_states)['W0001']
-        assert rt.length_m == ad.DEFAULT_WAGON_LENGTH_M
-
     def test_empty_input_returns_empty(self):
         """Empty or missing location logs should yield no timelines."""
         assert ad.extract_timelines(None, None) == {}
@@ -277,16 +278,21 @@ class TestWagonLengths:
 
 
 class TestBuildLayout:
-    """Tests for the synthetic yard layout."""
+    """Tests for the left-throat synthetic yard layout."""
 
-    def test_track_type_ordering_top_to_bottom(self, layout):
-        """Mainline sits at the top lane and rescource_parking at the bottom."""
-        assert layout.tracks['Mainline'].lane_y == max(t.lane_y for t in layout.tracks.values())
-        assert layout.tracks['track_19'].lane_y == min(t.lane_y for t in layout.tracks.values())
+    def test_tracks_are_left_throat(self, layout):
+        """Every non-mainline track's throat is on its left edge and extends right."""
+        for tl in layout.tracks.values():
+            if tl.zone == 'mainline':
+                continue
+            assert tl.throat_x == pytest.approx(tl.x_start)
+            assert tl.x_end > tl.x_start
 
-    def test_workshop_adjacent_to_retrofit(self, layout):
-        """The workshop lane should sit directly below its retrofit lane."""
-        assert layout.tracks['retrofit1'].lane_y - layout.tracks['WS_01'].lane_y == pytest.approx(ad.LANE_SPACING)
+    def test_mainline_is_bottom_corridor(self, layout):
+        """The mainline sits at the top lane in single-column mode."""
+        main = layout.tracks['Mainline']
+        assert main.zone == 'single'
+        assert main.lane_y == max(t.lane_y for t in layout.tracks.values())
 
     def test_workshop_tagged_with_bays(self, layout):
         """Workshop tracks should be tagged and carry their bay count."""
@@ -296,106 +302,153 @@ class TestBuildLayout:
 
     def test_x_axis_is_metric(self, layout):
         """Non-mainline tracks span their real length in metres from the throat."""
-        assert layout.tracks['collection1'].x_end == pytest.approx(500.0)
-        assert layout.tracks['retrofitted1'].x_end == pytest.approx(704.0)
+        assert layout.tracks['collection1'].x_end - layout.tracks['collection1'].x_start == pytest.approx(500.0)
+        assert layout.tracks['retrofitted1'].x_end - layout.tracks['retrofitted1'].x_start == pytest.approx(704.0)
 
-    def test_mainline_not_to_scale(self, layout):
-        """The 8000 m mainline is drawn at the fixed transit length."""
-        assert layout.tracks['Mainline'].x_end == pytest.approx(ad.MAINLINE_DRAWN_M)
-
-
-# --- Stable position allocation ---------------------------------------------
+    def test_single_mode_without_remote(self, layout):
+        """Without a remote cluster the layout uses the single-column mode."""
+        assert layout.mode == 'single'
 
 
-class TestAssignPositions:
-    """Tests for the stable, uniform-gap position allocator."""
+# --- Stack (LIFO) compaction ------------------------------------------------
 
-    def test_uniform_gap_between_adjacent_wagons(self, layout):
-        """Adjacent parked wagons sit exactly UNIFORM_GAP_M apart, regardless of length."""
-        timelines = _two_wagons('collection1', 15.9, 23.5)
-        ad.assign_positions(layout, timelines)
-        a, b = timelines['A'].dwells[0], timelines['B'].dwells[0]
-        # Storage packs from the far end: A (first) is furthest, B is closer to the throat.
-        a_near = a.center_x - timelines['A'].length_m / 2  # edge toward the throat
-        b_far = b.center_x + timelines['B'].length_m / 2  # edge toward the far end
+
+class TestCompaction:
+    """Tests for the per-frame, hole-free stack compaction."""
+
+    def test_stack_packs_earliest_deepest(self):
+        """Earliest arrival sits at the far (right) end; later arrivals toward the throat."""
+        layout = _one_track_layout('collection', 100.0)
+        timelines = _wagons('T', [('A', 16.0, 0.0, 200.0), ('B', 16.0, 10.0, 200.0)])
+        centers = ad._packed_centers(layout, timelines, 'T', 100.0)
+        assert centers['A'] == pytest.approx(92.0)  # 100 - 16/2, flush against far end
+        assert centers['B'] < centers['A']
+
+    def test_no_gap_between_adjacent(self):
+        """Adjacent packed wagons sit flush (no hole)."""
+        layout = _one_track_layout('collection', 100.0)
+        timelines = _wagons('T', [('A', 16.0, 0.0, 200.0), ('B', 24.0, 10.0, 200.0)])
+        a, b = (
+            ad._packed_centers(layout, timelines, 'T', 100.0)['A'],
+            ad._packed_centers(layout, timelines, 'T', 100.0)['B'],
+        )
+        a_near = a - 16.0 / 2  # throat-side edge of A
+        b_far = b + 24.0 / 2  # far-side edge of B
         assert a_near - b_far == pytest.approx(ad.UNIFORM_GAP_M)
 
-    def test_storage_packs_from_far_end(self, layout):
-        """The first arrival on a storage track sits flush against the far end."""
-        timelines = _two_wagons('collection1', 16.0, 16.0)
-        ad.assign_positions(layout, timelines)
-        x_end = layout.tracks['collection1'].x_end
-        assert timelines['A'].dwells[0].center_x == pytest.approx(x_end - 8.0)
-        assert timelines['B'].dwells[0].center_x < timelines['A'].dwells[0].center_x
+    def test_departure_makes_others_slide(self):
+        """When a wagon departs, the remaining present wagons re-pack flush (no hole)."""
+        layout = _one_track_layout('collection', 100.0)
+        timelines = _wagons('T', [('A', 16.0, 0.0, 50.0), ('B', 16.0, 0.0, 200.0)])
+        # While both present, B is left of A; after A leaves, B slides to the far end.
+        assert ad._packed_centers(layout, timelines, 'T', 10.0)['B'] < 92.0
+        assert ad._packed_centers(layout, timelines, 'T', 60.0)['B'] == pytest.approx(92.0)
 
-    def test_retrofit_packs_from_throat(self, layout):
-        """The first arrival on a retrofit track sits nearest the throat."""
-        timelines = _two_wagons('retrofit1', 16.0, 16.0)
-        ad.assign_positions(layout, timelines)
-        assert timelines['A'].dwells[0].center_x == pytest.approx(8.0)
-        assert timelines['B'].dwells[0].center_x > timelines['A'].dwells[0].center_x
+    def test_locomotive_sits_on_throat_side(self):
+        """A locomotive parked with wagons sits on the throat (left) side of them."""
+        layout = _one_track_layout('collection', 100.0)
+        timelines = _wagons('T', [('W', 16.0, 0.0, 200.0)])
+        loco = ad.ResourceTrack('L', 'locomotive', length_m=19.0, dwells=[ad.Dwell('T', 10.0, 200.0)])
+        loco.first_seen = 10.0
+        timelines['L'] = loco
+        centers = ad._packed_centers(layout, timelines, 'T', 100.0)
+        assert centers['L'] < centers['W']
 
-    def test_workshop_uses_bay_slots(self, layout):
-        """Workshop occupants take distinct bay-slot centres."""
-        timelines = _two_wagons('WS_01', 16.0, 16.0)
-        ad.assign_positions(layout, timelines)
-        x_end = layout.tracks['WS_01'].x_end
-        centres = sorted([timelines['A'].dwells[0].center_x, timelines['B'].dwells[0].center_x])
-        assert centres == pytest.approx([x_end * 0.25, x_end * 0.75])
+    def test_workshop_uses_bay_slots(self):
+        """Workshop occupants take distinct bay-slot centres inside the box."""
+        layout = _one_track_layout('workshop', 260.0, bays=2)
+        timelines = _wagons('T', [('A', 16.0, 0.0, 200.0), ('B', 16.0, 10.0, 200.0)])
+        centers = sorted(ad._packed_centers(layout, timelines, 'T', 100.0).values())
+        assert centers == pytest.approx([260.0 * 0.25, 260.0 * 0.75])
 
-    def test_freed_space_is_reused(self, layout):
-        """After a wagon departs, a later arrival reuses its far-end slot."""
-        rt_a = ad.ResourceTrack('A', 'wagon', length_m=16.0, dwells=[ad.Dwell('collection1', 0.0, 50.0)])
-        rt_c = ad.ResourceTrack('C', 'wagon', length_m=16.0, dwells=[ad.Dwell('collection1', 60.0, 200.0)])
-        timelines = {'A': rt_a, 'C': rt_c}
-        ad.assign_positions(layout, timelines)
-        # A left before C arrived, so C reuses the far-end position.
-        assert rt_c.dwells[0].center_x == pytest.approx(rt_a.dwells[0].center_x)
-
-    def test_position_is_stable_during_dwell(self, layout):
-        """A stationary resource keeps the same position across its whole dwell."""
-        timelines = _two_wagons('collection1', 16.0, 24.0, depart_b=50.0)
-        ad.assign_positions(layout, timelines)
-        rt_a = timelines['A']
-        # A dwells [0, 200]; B leaves at 50. A's position must not change.
-        assert ad.position_at(rt_a, layout, 10.0) == ad.position_at(rt_a, layout, 120.0)
-
-
-class TestPackingGlitches:
-    """Tests locking the no-stacking / within-box packing fixes."""
+    def test_no_overlap_when_wagons_fit(self):
+        """Wagons whose true lengths fit must never overlap."""
+        layout = _one_track_layout('collection', 100.0)
+        timelines = _wagons('T', [(f'W{i}', 10.0, float(i), 200.0) for i in range(7)])
+        assert not _has_overlap(_intervals(layout, timelines, 'T', 150.0))
 
     def test_overflow_positions_are_distinct(self):
         """Over-capacity wagons pack sequentially (distinct centres), never stacked."""
         layout = _one_track_layout('collection', 10.0)
-        timelines = _n_wagons('T', 15, 1.0)  # 15 m of wagons on a 10 m track
-        ad.assign_positions(layout, timelines)
-        centres = [rt.dwells[0].center_x for rt in timelines.values()]
+        timelines = _wagons('T', [(f'W{i}', 1.0, float(i), 200.0) for i in range(15)])
+        centres = list(ad._packed_centers(layout, timelines, 'T', 150.0).values())
         assert len({round(c, 6) for c in centres}) == len(centres)
-
-    def test_storage_wagons_never_stack_when_they_fit(self):
-        """Wagons whose true lengths fit the track must not overlap (no gap inflation)."""
-        layout = _one_track_layout('collection', 10.0)
-        timelines = _n_wagons('T', 7, 1.0)  # 7 m of wagons on a 10 m track: fits flush
-        ad.assign_positions(layout, timelines)
-        assert not _has_overlap(_intervals_on(timelines, 'T', 100.0))
-
-    def test_retrofit_wagons_never_stack_when_they_fit(self):
-        """Retrofit-track packing also avoids overlap when the wagons fit."""
-        layout = _one_track_layout('retrofit', 10.0)
-        timelines = _n_wagons('T', 7, 1.0)
-        ad.assign_positions(layout, timelines)
-        assert not _has_overlap(_intervals_on(timelines, 'T', 100.0))
 
     def test_workshop_overflow_stays_within_box(self):
         """More wagons than bays must still render inside the workshop box."""
         layout = _one_track_layout('workshop', 260.0, bays=2)
-        timelines = _n_wagons('T', 3, 16.0)  # 3 wagons, only 2 bays
-        ad.assign_positions(layout, timelines)
+        timelines = _wagons('T', [(f'W{i}', 16.0, float(i), 200.0) for i in range(3)])
         tl = layout.tracks['T']
-        for rt in timelines.values():
-            center = rt.dwells[0].center_x
-            assert center - rt.length_m / 2.0 >= tl.x_start - 1e-6
-            assert center + rt.length_m / 2.0 <= tl.x_end + 1e-6
+        for rid, center in ad._packed_centers(layout, timelines, 'T', 150.0).items():
+            half = timelines[rid].length_m / 2.0
+            assert center - half >= tl.x_start - 1e-6
+            assert center + half <= tl.x_end + 1e-6
+
+
+# --- Consist coupling -------------------------------------------------------
+
+
+class TestConsists:
+    """Tests for loco/wagon consist inference and synchronised motion."""
+
+    @staticmethod
+    def _coupled() -> dict[str, ad.ResourceTrack]:
+        """Build a loco and two wagons making the same collection1->retrofit1 trip."""
+        wagons = {}
+        for rid, t_arr in (('W1', 0.0), ('W2', 5.0)):
+            rt = ad.ResourceTrack(rid, 'wagon', length_m=16.0)
+            rt.dwells = [ad.Dwell('collection1', t_arr, 100.0), ad.Dwell('retrofit1', 200.0, math.inf)]
+            rt.moves = [ad.Move(100.0, 200.0, ('collection1', 'Mainline', 'retrofit1'), 'collection1', 'retrofit1')]
+            rt.first_seen = t_arr
+            wagons[rid] = rt
+        loco = ad.ResourceTrack('L', 'locomotive', length_m=19.0)
+        loco.dwells = [ad.Dwell('collection1', 90.0, 95.0), ad.Dwell('retrofit1', 130.0, math.inf)]
+        loco.moves = [ad.Move(95.0, 130.0, (), 'collection1', 'retrofit1')]
+        loco.first_seen = 90.0
+        return {**wagons, 'L': loco}
+
+    def test_loco_move_snaps_to_rake_window(self):
+        """The loco's hauling move is snapped to the rake's depart/arrive window."""
+        timelines = self._coupled()
+        legs = ad.infer_consists(timelines)
+        assert 'L' in legs
+        leg = legs['L'][0]
+        assert (leg.t_depart, leg.t_arrive) == (100.0, 200.0)
+        assert timelines['L'].moves[0].t_depart == 100.0
+        assert timelines['L'].moves[0].t_arrive == 200.0
+
+    def test_consist_includes_loco_and_wagons(self):
+        """The leg lists the loco first, then its wagons."""
+        leg = ad.infer_consists(self._coupled())['L'][0]
+        assert leg.car_ids[0] == 'L'
+        assert set(leg.car_ids[1:]) == {'W1', 'W2'}
+
+    def test_loco_leads_throat_side_during_transit(self, tracks_config, topology, workshops_config):
+        """Mid-transit the loco stays on the throat side and cars do not overlap."""
+        graph = rg.parse_routes(
+            {'routes': [{'id': 'r', 'duration': 5.0, 'path': ['collection1', 'Mainline', 'retrofit1']}]}
+        )
+        layout = ad.build_layout(tracks_config, topology, workshops_config, graph, sorted(graph.track_ids))
+        timelines = self._coupled()
+        legs = ad.assign_positions(layout, timelines)
+        # At arrival the loco sits on the throat side (smaller x) of both wagons.
+        loco_x = ad.position_at(timelines['L'], layout, timelines, 200.0, legs)[0]
+        w1_x = ad.position_at(timelines['W1'], layout, timelines, 200.0, legs)[0]
+        w2_x = ad.position_at(timelines['W2'], layout, timelines, 200.0, legs)[0]
+        assert loco_x < w1_x
+        assert loco_x < w2_x
+        assert abs(w1_x - w2_x) > 1e-6  # the two wagons do not coincide
+
+    def test_unmatched_loco_trip_left_alone(self):
+        """A loco trip with no matching wagons produces no leg."""
+        loco = ad.ResourceTrack('L', 'locomotive', length_m=19.0)
+        loco.dwells = [ad.Dwell('track_19', 0.0, 10.0), ad.Dwell('collection1', 22.0, math.inf)]
+        loco.moves = [ad.Move(10.0, 22.0, (), 'track_19', 'collection1')]
+        loco.first_seen = 0.0
+        assert ad.infer_consists({'L': loco}) == {}
+
+
+# --- Frame stats ------------------------------------------------------------
 
 
 class TestFrameStats:
@@ -446,7 +499,6 @@ class TestFrameStats:
         assert all(isinstance(f.stats, ad.FrameStats) for f in frames)
         last = frames[-1]
         assert len(last.wagon_shade) == len(last.wagon_x)
-        # Two flush neighbours on the same lane get alternating shades.
         if len(last.wagon_shade) == 2:
             assert set(last.wagon_shade) == {0, 1}
 
@@ -457,30 +509,27 @@ class TestFrameStats:
 class TestPositionAt:
     """Tests for the position resolver."""
 
-    def test_endpoints_match_dwell_centres(self, layout, w0001_locations, w0001_states):
-        """At departure/arrival the resource sits at its source/dest dwell centre."""
+    def test_parked_uses_compacted_slot(self, layout, w0001_locations, w0001_states):
+        """At a dwell the wagon sits at its compacted slot on the track lane."""
         timelines = ad.extract_timelines(w0001_locations, w0001_states)
-        ad.assign_positions(layout, timelines)
+        legs = ad.assign_positions(layout, timelines)
         rt = timelines['W0001']
-        at_depart = ad.position_at(rt, layout, 433.0)
-        assert at_depart == pytest.approx((rt.dwells[0].center_x, layout.tracks['collection1'].lane_y))
-        at_arrive = ad.position_at(rt, layout, 493.0)
-        assert at_arrive == pytest.approx((rt.dwells[1].center_x, layout.tracks['retrofit1'].lane_y))
+        expected_x = ad._packed_centers(layout, timelines, 'collection1', 360.0)['W0001']
+        pos = ad.position_at(rt, layout, timelines, 360.0, legs)
+        assert pos == pytest.approx((expected_x, layout.tracks['collection1'].lane_y))
 
-    def test_midpoint_routes_through_throat(self, layout, w0001_locations, w0001_states):
-        """Mid-transit the marker routes through the throat (x near zero)."""
+    def test_move_routes_through_throat(self, layout, w0001_locations, w0001_states):
+        """An intra-zone move routes through the throat (x == throat_x)."""
         timelines = ad.extract_timelines(w0001_locations, w0001_states)
         ad.assign_positions(layout, timelines)
-        rt = timelines['W0001']
-        mid = ad.position_at(rt, layout, 463.0)
-        assert mid is not None
-        assert mid[0] <= rt.dwells[0].center_x + 1e-9
+        waypoints = ad._move_waypoints(layout, timelines['W0001'].moves[0])
+        assert any(abs(p[0] - layout.throat_x) < 1e-9 for p in waypoints)
 
     def test_none_before_first_seen(self, layout, w0001_locations, w0001_states):
         """A resource has no position before it first appears."""
         timelines = ad.extract_timelines(w0001_locations, w0001_states)
-        ad.assign_positions(layout, timelines)
-        assert ad.position_at(timelines['W0001'], layout, 100.0) is None
+        legs = ad.assign_positions(layout, timelines)
+        assert ad.position_at(timelines['W0001'], layout, timelines, 100.0, legs) is None
 
 
 # --- Frame builder ----------------------------------------------------------
@@ -495,7 +544,7 @@ class TestBuildFrames:
         assert len(ad.build_frames(layout, timelines, num_frames=50)) == 50
 
     def test_first_frame_carries_position_and_length(self, layout, w0001_locations, w0001_states, train_schedule):
-        """The first frame places the wagon at its dwell centre and carries its length."""
+        """The first frame places the wagon at its compacted slot and carries its length."""
         lengths = ad.wagon_lengths(train_schedule)
         timelines = ad.extract_timelines(w0001_locations, w0001_states, lengths)
         frames = ad.build_frames(layout, timelines, num_frames=10)
@@ -503,10 +552,11 @@ class TestBuildFrames:
         assert first.t == pytest.approx(360.0)
         assert first.wagon_ids == ['W0001']
         assert first.wagon_len[0] == pytest.approx(15.9)
-        assert first.wagon_x[0] == pytest.approx(timelines['W0001'].dwells[0].center_x)
+        expected_x = ad._packed_centers(layout, timelines, 'collection1', 360.0)['W0001']
+        assert first.wagon_x[0] == pytest.approx(expected_x)
 
     def test_color_flips_at_retrofit_time(self, layout, w0001_locations, w0001_states):
-        """Wagon colour switches from red to green at the retrofit timestamp."""
+        """Wagon colour switches from blue to green at the retrofit timestamp."""
         timelines = ad.extract_timelines(w0001_locations, w0001_states)
         frames = ad.build_frames(layout, timelines, num_frames=3, bounds=(560.0, 580.0))
         assert frames[0].wagon_color[0] == ad.WAGON_COLOR_PENDING
@@ -579,58 +629,51 @@ class TestRoutesAwareLayout:
         tracks, topology, workshops, routes = self._h4r_config()
         graph = rg.parse_routes(routes)
         layout = ad.build_layout(tracks, topology, workshops, graph, sorted(graph.track_ids))
-        assert 'WS_01' in layout.tracks
         ws = layout.tracks['WS_01']
         assert ws.is_workshop is True
         assert ws.bays == 2
-        assert ws.length_m == pytest.approx(260.0)  # default from WS1's length
+        assert ws.length_m == pytest.approx(260.0)
 
-    def test_three_zone_placement(self):
-        """With a remote cluster the layout uses three zones (left / Mainline / right)."""
+    def test_two_zone_placement(self):
+        """With a remote cluster the layout uses three zones (left | corridor | right)."""
         tracks, topology, workshops, routes = self._h4r_config()
         graph = rg.parse_routes(routes)
         layout = ad.build_layout(tracks, topology, workshops, graph, sorted(graph.track_ids))
         assert layout.mode == 'zones'
-        # Local yard on the left (right of throat), remote on the right, Mainline in the middle.
         assert layout.tracks['retrofit'].zone == 'left'
         assert layout.tracks['collection1'].zone == 'right'
         assert layout.tracks['Mainline'].zone == 'middle'
+        # Local yard left of left ladder, remote right of right ladder.
         assert layout.tracks['retrofit'].x_end <= layout.left_throat_x + 1e-9
         assert layout.tracks['collection1'].x_start >= layout.right_throat_x - 1e-9
         assert layout.left_throat_x < layout.right_throat_x < layout.x_max
 
-    def test_mainline_corridor_at_most_quarter_width(self):
-        """The Mainline corridor occupies no more than 25% of the total width."""
+    def test_mainline_corridor_in_the_middle(self):
+        """The mainline corridor spans between the two ladders at corridor_y."""
         tracks, topology, workshops, routes = self._h4r_config()
         graph = rg.parse_routes(routes)
         layout = ad.build_layout(tracks, topology, workshops, graph, sorted(graph.track_ids))
-        middle_w = layout.right_throat_x - layout.left_throat_x
-        assert middle_w <= 0.25 * layout.x_max + 1e-9
+        main = layout.tracks['Mainline']
+        assert main.lane_y == pytest.approx(layout.corridor_y)
+        assert main.x_start == pytest.approx(layout.left_throat_x)
+        assert main.x_end == pytest.approx(layout.right_throat_x)
 
-    def test_cross_zone_move_passes_through_mainline_corridor(self):
+    def test_cross_zone_move_passes_through_corridor(self):
         """A local<->remote move routes through the Mainline corridor height."""
         tracks, topology, workshops, routes = self._h4r_config()
         graph = rg.parse_routes(routes)
         layout = ad.build_layout(tracks, topology, workshops, graph, sorted(graph.track_ids))
         rt = ad.ResourceTrack('W', 'wagon', length_m=16.0)
         rt.dwells = [ad.Dwell('collection1', 0.0, 100.0), ad.Dwell('retrofit', 200.0, math.inf)]
-        rt.moves = [
-            ad.Move(
-                t_depart=100.0,
-                t_arrive=200.0,
-                route=('collection1', 'Mainline', 'retrofit'),
-                from_track='collection1',
-                to_track='retrofit',
-            )
-        ]
+        rt.moves = [ad.Move(100.0, 200.0, ('collection1', 'Mainline', 'retrofit'), 'collection1', 'retrofit')]
+        rt.first_seen = 0.0
         ad.assign_positions(layout, {'W': rt})
         waypoints = ad._move_waypoints(layout, rt.moves[0])
         corridor_pts = [p for p in waypoints if abs(p[1] - layout.corridor_y) < 1e-9]
-        # The path runs along the corridor from the right ladder to the left ladder.
         assert any(abs(p[0] - layout.left_throat_x) < 1e-9 for p in corridor_pts)
         assert any(abs(p[0] - layout.right_throat_x) < 1e-9 for p in corridor_pts)
 
-    def test_layout_without_routes_is_backward_compatible(self):
+    def test_layout_without_routes_is_single_mode(self):
         """Without a route graph the layout falls back to a single stacked column."""
         tracks, topology, workshops, _routes = self._h4r_config()
         layout = ad.build_layout(tracks, topology, workshops)

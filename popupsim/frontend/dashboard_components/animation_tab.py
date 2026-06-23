@@ -163,7 +163,7 @@ _WAGON_BORDER_DONE = '#04503a'
 _LOCO_BORDER = '#f1c40f'
 _STATS_FONT = {'size': 12, 'color': '#2c3e50'}
 _UTIL_FONT_SIZE = 16
-_UTIL_THROAT_OFFSET_M = 14.0
+_UTIL_OFFSET_M = 30.0  # gap past a track's throat end for its utilization label (toward middle)
 
 
 def _wagon_groups(frame: ad.FrameData) -> dict[tuple[str, int], dict[str, list[float]]]:
@@ -197,17 +197,16 @@ def _label_trace(frame: ad.FrameData, show_labels: bool) -> go.Scatter:
 
 
 def _counters_trace(frame: ad.FrameData, layout: ad.YardLayout) -> go.Scatter:
-    """Build the live counters text block, placed in the middle (empty) section."""
+    """Build the live counters text block, placed above the layout."""
     s = frame.stats
     text = (
         f'<b>To retrofit (in system): {s.to_retrofit}</b><br>'
-        f'Retrofitted (in system): {s.present_retrofitted}<br>'
         f'Retrofitted (cumulative): {s.cumulative_retrofitted}<br>'
         f'Rejected (cumulative): {s.cumulative_rejected}'
     )
     if layout.mode == 'zones':
         x = (layout.left_throat_x + layout.right_throat_x) / 2.0
-        y = layout.corridor_y + 1.0
+        y = layout.y_max + 0.9
     else:
         x = layout.x_max * 0.5
         y = layout.y_max + 0.7
@@ -233,11 +232,12 @@ def _utilization_trace(frame: ad.FrameData, layout: ad.YardLayout) -> go.Scatter
         tl = layout.tracks.get(track_id)
         if tl is None:
             continue
-        # Place the label on the throat side: in zone mode that is the inner
-        # (corridor) side — right of the left throat, left of the right throat.
-        toward_throat = 1.0 if tl.throat_x >= (tl.x_start + tl.x_end) / 2.0 else -1.0
-        to_corridor = 1.0 if layout.mode == 'zones' else -1.0
-        xs.append(tl.throat_x + toward_throat * to_corridor * _UTIL_THROAT_OFFSET_M)
+        # Place the label on the throat (inner) side: right of throat for the
+        # left panel, left of throat for the right panel.
+        if abs(tl.throat_x - tl.x_end) < 1e-9:
+            xs.append(tl.x_end + _UTIL_OFFSET_M)
+        else:
+            xs.append(tl.x_start - _UTIL_OFFSET_M)
         ys.append(tl.lane_y)
         texts.append(f'{usage * 100:.0f}%')
         colors.append('#c0392b' if usage > 1.0 else '#34495e')
@@ -357,13 +357,11 @@ def _add_single_geometry(fig: go.Figure, layout: ad.YardLayout) -> None:
             xanchor='right',
             font={'size': 9, 'color': '#555'},
         )
-    _add_cluster_labels(fig, layout)
 
 
 def _add_zone_geometry(fig: go.Figure, layout: ad.YardLayout) -> None:
     """Three-zone layout: local yard | Mainline corridor | remote storage."""
     y_lo, y_hi = layout.y_min - 0.6, layout.y_max + 0.6
-    # Zone background bands.
     fig.add_shape(
         type='rect',
         x0=0,
@@ -386,7 +384,6 @@ def _add_zone_geometry(fig: go.Figure, layout: ad.YardLayout) -> None:
         line={'width': 0},
         layer='below',
     )
-    # Ladders (the connecting throat at each zone's inner edge).
     for ladder_x in (layout.left_throat_x, layout.right_throat_x):
         fig.add_shape(
             type='line',
@@ -397,7 +394,6 @@ def _add_zone_geometry(fig: go.Figure, layout: ad.YardLayout) -> None:
             line={'color': '#bdc3c7', 'width': 3, 'dash': 'dot'},
             layer='below',
         )
-    # Mainline corridor spanning the middle.
     main_color = ad.TRACK_TYPE_COLORS['mainline']
     fig.add_shape(
         type='line',
@@ -409,7 +405,6 @@ def _add_zone_geometry(fig: go.Figure, layout: ad.YardLayout) -> None:
         opacity=0.85,
         layer='below',
     )
-
     for tl in layout.tracks.values():
         if tl.track_type == 'mainline':
             continue
@@ -419,19 +414,14 @@ def _add_zone_geometry(fig: go.Figure, layout: ad.YardLayout) -> None:
         else:
             label_x, anchor = tl.x_start - _LABEL_OFFSET_M, 'right'
         fig.add_annotation(
-            x=label_x,
-            y=tl.lane_y,
-            text=tl.track_id,
-            showarrow=False,
-            xanchor=anchor,
-            font={'size': 9, 'color': '#555'},
+            x=label_x, y=tl.lane_y, text=tl.track_id, showarrow=False, xanchor=anchor, font={'size': 9, 'color': '#555'}
         )
     _add_zone_titles(fig, layout)
 
 
 def _add_zone_titles(fig: go.Figure, layout: ad.YardLayout) -> None:
-    """Add the three zone headings above the layout."""
-    y = layout.y_max + 0.9
+    """Add the three zone headings below the layout."""
+    y = layout.corridor_y - 0.7
     titles = [
         (layout.left_throat_x / 2.0, 'Local retrofit yard', '#2471a3'),
         ((layout.left_throat_x + layout.right_throat_x) / 2.0, '🚆 Main line', '#566573'),
@@ -439,31 +429,6 @@ def _add_zone_titles(fig: go.Figure, layout: ad.YardLayout) -> None:
     ]
     for x, text, color in titles:
         fig.add_annotation(x=x, y=y, text=text, showarrow=False, font={'size': 11, 'color': color})
-
-
-def _add_cluster_labels(fig: go.Figure, layout: ad.YardLayout) -> None:
-    """Annotate the connectivity clusters on the right margin (single mode)."""
-    labels = {'remote': 'Arrival / remote storage', 'local': 'Local retrofit yard', 'hub': 'Local retrofit yard'}
-    grouped: dict[str, list[float]] = {}
-    for tl in layout.tracks.values():
-        if tl.track_type == 'mainline':
-            continue
-        grouped.setdefault(tl.cluster, []).append(tl.lane_y)
-    seen: set[str] = set()
-    for cluster, ys in grouped.items():
-        text = labels.get(cluster)
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        fig.add_annotation(
-            x=layout.x_max,
-            y=sum(ys) / len(ys),
-            text=text,
-            showarrow=False,
-            xanchor='left',
-            textangle=90,
-            font={'size': 10, 'color': '#888'},
-        )
 
 
 def _draw_workshop(fig: go.Figure, tl: ad.TrackLayout) -> None:
@@ -570,7 +535,7 @@ def _build_figure(
         margin={'l': 10, 'r': 40, 't': 30, 'b': 10},
         plot_bgcolor='white',
         xaxis={'visible': False, 'range': [-_LABEL_OFFSET_M * 5, layout.x_max + _LABEL_OFFSET_M * 4]},
-        yaxis={'visible': False, 'range': [layout.y_min - 0.8, layout.y_max + 1.0]},
+        yaxis={'visible': False, 'range': [layout.y_min - 1.8, layout.y_max + 1.9]},
         legend={'orientation': 'h', 'yanchor': 'bottom', 'y': 1.02, 'xanchor': 'left', 'x': 0},
         updatemenus=updatemenus,
         sliders=sliders,
