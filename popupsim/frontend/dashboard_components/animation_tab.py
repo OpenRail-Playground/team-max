@@ -165,7 +165,7 @@ def _rect_trace(xs: list[float], ys: list[float], lengths: list[float], color: s
 _WAGON_BORDER_PENDING = '#013a63'
 _WAGON_BORDER_DONE = '#04503a'
 _LOCO_BORDER = '#f1c40f'
-_STATS_FONT = {'size': 12, 'color': '#2c3e50'}
+_STATS_FONT = {'size': 17, 'color': '#2c3e50'}
 _UTIL_FONT_SIZE = 16
 _UTIL_OFFSET_M = 30.0  # gap past a track's throat end for its utilization label (toward middle)
 
@@ -204,16 +204,16 @@ def _counters_trace(frame: ad.FrameData, layout: ad.YardLayout) -> go.Scatter:
     """Build the live counters text block, placed above the layout."""
     s = frame.stats
     text = (
-        f'<b>To retrofit (in system): {s.to_retrofit}</b><br>'
-        f'Retrofitted (cumulative): {s.cumulative_retrofitted}<br>'
-        f'Rejected (cumulative): {s.cumulative_rejected}'
+        f'<b>To retrofit: {s.to_retrofit}<br>'
+        f'Retrofitted: {s.cumulative_retrofitted}<br>'
+        f'Rejected: {s.cumulative_rejected}</b>'
     )
     if layout.mode == 'zones':
         x = (layout.left_throat_x + layout.right_throat_x) / 2.0
-        y = layout.y_max + 0.9
+        y = layout.y_max + 0.7
     else:
         x = layout.x_max * 0.5
-        y = layout.y_max + 0.7
+        y = layout.y_max + 0.5
     return go.Scatter(
         x=[x],
         y=[y],
